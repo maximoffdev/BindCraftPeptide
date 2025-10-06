@@ -44,7 +44,7 @@ def generate_dataframe_labels():
 def generate_directories(design_path):
     design_path_names = ["Accepted", "Accepted/Ranked", "Accepted/Animation", "Accepted/Plots", "Accepted/Pickle", "Trajectory",
                         "Trajectory/Relaxed", "Trajectory/Plots", "Trajectory/Clashing", "Trajectory/LowConfidence", "Trajectory/Animation",
-                        "Trajectory/Pickle", "MPNN", "MPNN/Binder", "MPNN/Sequences", "MPNN/Relaxed", "Rejected"]
+                        "Trajectory/Pickle", "MPNN", "MPNN/Binder", "MPNN/Sequences", "MPNN/Relaxed", "Rejected", "AF2", "AF2/Relaxed", "AF2/Binder"]
     design_paths = {}
 
     # make directories and set design_paths[FOLDER_NAME] variable

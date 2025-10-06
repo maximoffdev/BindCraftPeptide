@@ -1,5 +1,7 @@
 import os
 import time
+import shutil
+import pandas as pd
 
 # Import specific utilities needed by this module
 from .colabdesign_utils import predict_binder_complex, predict_binder_alone
@@ -8,10 +10,10 @@ from .pyrosetta_utils import score_interface, unaligned_rmsd
 from .generic_utils import calculate_averages, check_filters, insert_data, save_fasta
 
 
-def filter_design(sequence, design_name, design_paths, trajectory_pdb, length, helicity_value,
+def filter_design(sequence, basis_design_name, design_paths, trajectory_pdb, length, helicity_value,
                   seed, prediction_models, binder_chain, filters, design_labels, target_settings, 
                   advanced_settings, advanced_file, settings_file, filters_file, stats_csv, 
-                  failure_csv, complex_prediction_model, binder_prediction_model, 
+                  failure_csv, final_csv, complex_prediction_model, binder_prediction_model, 
                   is_mpnn_model=False, mpnn_n=None):
     
 
@@ -30,7 +32,7 @@ def filter_design(sequence, design_name, design_paths, trajectory_pdb, length, h
         mpnn_sequence = sequence  # For MPNN, sequence is already a dict with 'seq', 'score', 'seqid'
 
         # Generate unique name for this MPNN design (e.g., PDL1_l10_s12345_mpnn1)
-        design_name = design_name + "_mpnn" + str(mpnn_n)
+        design_name = basis_design_name + "_mpnn" + str(mpnn_n)
         mpnn_score = round(mpnn_sequence['score'],2)  # MPNN confidence score
         mpnn_seqid = round(mpnn_sequence['seqid'],2)  # Sequence identity to trajectory
 
@@ -43,6 +45,7 @@ def filter_design(sequence, design_name, design_paths, trajectory_pdb, length, h
         sequence = {'seq': sequence}  # For AF2-only, wrap sequence string in dict for consistency
         mpnn_score = sequence.get('score', '')  # May be empty string if not provided
         mpnn_seqid = sequence.get('seqid', '')  # May be empty string if not provided
+        design_name = basis_design_name  # Use base name directly for AF2-only designs
 
     ### === PREDICT BINDER-TARGET COMPLEX ===
     # predict_binder_complex: Runs AF2 prediction on MPNN sequence bound to target
@@ -53,12 +56,12 @@ def filter_design(sequence, design_name, design_paths, trajectory_pdb, length, h
                                                                     sequence['seq'], design_name,
                                                                     target_settings["starting_pdb"], target_settings["chains"],
                                                                     length, trajectory_pdb, prediction_models, advanced_settings,
-                                                                    filters, design_paths, failure_csv)
+                                                                    filters, design_paths, failure_csv, design_path_key="MPNN" if is_mpnn_model else "AF2")
 
     # If basic AF2 quality filters failed, skip expensive interface scoring and move to next sequence
     if not pass_af2_filters:
         print(f"Base AF2 filters not passed for {design_name}, skipping interface scoring")
-        return None, "", [], design_name, stats_csv
+        return False, stats_csv, failure_csv, final_csv
 
     # === CALCULATE DETAILED INTERFACE METRICS FOR EACH AF2 MODEL ===
     # For each AF2 model weight used in prediction, calculate detailed structural properties
@@ -141,7 +144,8 @@ def filter_design(sequence, design_name, design_paths, trajectory_pdb, length, h
     # predict_binder_alone: Runs AF2 in hallucination mode (no template) with just binder sequence
     #   Returns structure quality metrics (pLDDT, pTM, pAE)
     binder_statistics = predict_binder_alone(binder_prediction_model, sequence['seq'], design_name, length,
-                                            trajectory_pdb, binder_chain, prediction_models, advanced_settings, design_paths)
+                                            trajectory_pdb, binder_chain, prediction_models, advanced_settings, 
+                                            design_paths, design_path_key="MPNN" if is_mpnn_model else "AF2")
 
     # === CALCULATE BINDER-ALONE RMSD TO TRAJECTORY ===
     # Check how much the binder structure changes when target is removed
@@ -235,5 +239,87 @@ def filter_design(sequence, design_name, design_paths, trajectory_pdb, length, h
     #   Filters can include thresholds for pLDDT, binding energy, clashes, etc.
     filter_conditions = check_filters(data, design_labels, filters)
 
-    return filter_conditions, best_model_pdb, data, design_name, stats_csv
+
+    if filter_conditions == True:
+        # === DESIGN PASSED ALL FILTERS - ACCEPT IT ===
+        print(design_name+" passed all filters")
+        
+        # Copy best model to Accepted folder for easy access
+        shutil.copy(best_model_pdb, design_paths["Accepted"])
+
+        # Add to final designs CSV (with empty first column for notes/ranking)
+        final_data = [''] + data
+        insert_data(final_csv, final_data)
+
+        # Copy trajectory animation to Accepted folder (if enabled and not already copied)
+        if advanced_settings["save_design_animations"]:
+            accepted_animation = os.path.join(design_paths["Accepted/Animation"], f"{basis_design_name}.html")
+            if not os.path.exists(accepted_animation):
+                shutil.copy(os.path.join(design_paths["Trajectory/Animation"], f"{basis_design_name}.html"), accepted_animation)
+
+        # Copy trajectory loss plots to Accepted folder
+        plot_files = os.listdir(design_paths["Trajectory/Plots"])
+        plots_to_copy = [f for f in plot_files if f.startswith(basis_design_name) and f.endswith('.png')]
+        for accepted_plot in plots_to_copy:
+            source_plot = os.path.join(design_paths["Trajectory/Plots"], accepted_plot)
+            target_plot = os.path.join(design_paths["Accepted/Plots"], accepted_plot)
+            if not os.path.exists(target_plot):
+                shutil.copy(source_plot, target_plot)
+
+    else:
+        # === DESIGN FAILED FILTERS - REJECT IT ===
+        print(f"Unmet filter conditions for {basis_design_name}")
+        
+        # Update failure statistics CSV to track which filters are failing most often
+        failure_df = pd.read_csv(failure_csv)
+        
+        # Handle filter column names that may have model-specific prefixes (Average_, 1_, 2_, etc.)
+        special_prefixes = ('Average_', '1_', '2_', '3_', '4_', '5_')
+        incremented_columns = set()  # Track which base columns we've already incremented
+
+        # For each failed filter, increment its failure count (only once per base metric)
+        for column in filter_conditions:
+            base_column = column
+            # Strip model prefix to get base metric name
+            for prefix in special_prefixes:
+                if column.startswith(prefix):
+                    base_column = column.split('_', 1)[1]
+
+            # Only increment each base metric once (even if multiple models failed)
+            if base_column not in incremented_columns:
+                failure_df[base_column] = failure_df[base_column] + 1
+                incremented_columns.add(base_column)
+
+        # Save updated failure counts
+        failure_df.to_csv(failure_csv, index=False)
+        
+        # Move rejected design to Rejected folder for later review
+        shutil.copy(best_model_pdb, design_paths["Rejected"])
+
+
+    return filter_conditions, stats_csv, failure_csv, final_csv
+
+
+def init_prediction_models(trajectory_pdb, length, mk_afdesign_model, multimer_validation, target_settings, advanced_settings):
+    complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings["num_recycles_validation"], data_dir=advanced_settings["af_params_dir"], 
+                                                                use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
+    
+    # Choose template mode: use trajectory structure as template OR use original target structure
+    if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
+        # Use the designed trajectory structure as starting point (biases prediction toward designed pose)
+        complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
+                                            rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=True)
+    else:
+        # Use only the original target structure (unbiased prediction - tests if sequence really folds to bind)
+        complex_prediction_model.prep_inputs(pdb_filename=target_settings["starting_pdb"], chain=target_settings["chains"], binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
+                                            rm_target_sc=advanced_settings["rm_template_sc_predict"])
+
+    # Compile binder-alone prediction model (tests if binder is stable without target)
+    # This checks for stability and detects if the binder requires the target to fold
+    binder_prediction_model = mk_afdesign_model(protocol="hallucination", use_templates=False, initial_guess=False, 
+                                                use_initial_atom_pos=False, num_recycles=advanced_settings["num_recycles_validation"], 
+                                                data_dir=advanced_settings["af_params_dir"], use_multimer=multimer_validation)
+    binder_prediction_model.prep_inputs(length=length)
+
+    return complex_prediction_model, binder_prediction_model
 

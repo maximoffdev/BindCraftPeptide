@@ -295,7 +295,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
     return af_model
 
 # run prediction for binder with masked template target
-def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, target_pdb, chain, length, trajectory_pdb, prediction_models, advanced_settings, filters, design_paths, failure_csv, seed=None):
+def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, target_pdb, chain, length, trajectory_pdb, prediction_models, advanced_settings, filters, design_paths, failure_csv, seed=None, design_path_key="MPNN",):
     prediction_stats = {}
 
     # clean sequence
@@ -308,7 +308,7 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
     # start prediction per AF2 model, 2 are used by default due to masked templates
     for model_num in prediction_models:
         # check to make sure prediction does not exist already
-        complex_pdb = os.path.join(design_paths["MPNN"], f"{mpnn_design_name}_model{model_num+1}.pdb")
+        complex_pdb = os.path.join(design_paths[design_path_key], f"{mpnn_design_name}_model{model_num+1}.pdb")
         if not os.path.exists(complex_pdb):
             # predict model
             prediction_model.predict(seq=binder_sequence, models=[model_num], num_recycles=advanced_settings["num_recycles_validation"], verbose=False)
@@ -354,16 +354,16 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
 
     # AF2 filters passed, contuing with relaxation
     for model_num in prediction_models:
-        complex_pdb = os.path.join(design_paths["MPNN"], f"{mpnn_design_name}_model{model_num+1}.pdb")
+        complex_pdb = os.path.join(design_paths[design_path_key], f"{mpnn_design_name}_model{model_num+1}.pdb")
         if pass_af2_filters:
-            mpnn_relaxed = os.path.join(design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{model_num+1}.pdb")
+            mpnn_relaxed = os.path.join(design_paths[design_path_key + "/Relaxed"], f"{mpnn_design_name}_model{model_num+1}.pdb")
             pr_relax(complex_pdb, mpnn_relaxed)
             # optional: staple disulfides in the binder chain after relaxation
             if advanced_settings.get("use_disulfide_loss", False):
                 binder_chain = advanced_settings.get("binder_chain", "B")
                 pairs = advanced_settings.get("disulfide_pairs_runtime") or advanced_settings.get("disulfide_pairs")
                 if pairs:
-                    stapled_out = os.path.join(design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{model_num+1}_stapled.pdb")
+                    stapled_out = os.path.join(design_paths[design_path_key + "/Relaxed"], f"{mpnn_design_name}_model{model_num+1}_stapled.pdb")
                     try:
                         _staple = getattr(pr_utils, "pr_staple_disulfides", None)
                         if _staple:
@@ -377,7 +377,7 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
     return prediction_stats, pass_af2_filters
 
 # run prediction for binder alone
-def predict_binder_alone(prediction_model, binder_sequence, mpnn_design_name, length, trajectory_pdb, binder_chain, prediction_models, advanced_settings, design_paths, seed=None):
+def predict_binder_alone(prediction_model, binder_sequence, mpnn_design_name, length, trajectory_pdb, binder_chain, prediction_models, advanced_settings, design_paths, seed=None, design_path_key="MPNN"):
     binder_stats = {}
 
     # prepare sequence for prediction
@@ -387,7 +387,7 @@ def predict_binder_alone(prediction_model, binder_sequence, mpnn_design_name, le
     # predict each model separately
     for model_num in prediction_models:
         # check to make sure prediction does not exist already
-        binder_alone_pdb = os.path.join(design_paths["MPNN/Binder"], f"{mpnn_design_name}_model{model_num+1}.pdb")
+        binder_alone_pdb = os.path.join(design_paths[design_path_key + "/Binder"], f"{mpnn_design_name}_model{model_num+1}.pdb")
         if not os.path.exists(binder_alone_pdb):
             # predict model
             prediction_model.predict(models=[model_num], num_recycles=advanced_settings["num_recycles_validation"], verbose=False)
@@ -401,7 +401,7 @@ def predict_binder_alone(prediction_model, binder_sequence, mpnn_design_name, le
             if advanced_settings.get("use_disulfide_loss", False):
                 pairs = advanced_settings.get("disulfide_pairs_runtime") or advanced_settings.get("disulfide_pairs")
                 if pairs:
-                    stapled_out = os.path.join(design_paths["MPNN/Binder"], f"{mpnn_design_name}_model{model_num+1}_stapled.pdb")
+                    stapled_out = os.path.join(design_paths[design_path_key + "/Binder"], f"{mpnn_design_name}_model{model_num+1}_stapled.pdb")
                     try:
                         _staple = getattr(pr_utils, "pr_staple_disulfides", None)
                         if _staple:

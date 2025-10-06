@@ -4,15 +4,21 @@ Adjustable plddt and iptm filters during AF2 design protocol --> done
 AF2 validation and filters outside MPNN loop
 
 
-Amino acid distribution losses during AF2 design protocol
-    - simple distriution loss
-    - ProteinMPNN distribution loss
-
-
 Disulfide peptide generation
     - terminal cystein sequence init
     - disulfide loss
     - pyrosetta disulfide closure and relax
+
+
+Optimize ProteinMPNN usage (biases, ...)
+
+
+Add pre-filtering step directly after AF2 design protocol (filtering out unwanted secondary structures etc.)
+
+
+Amino acid distribution losses during AF2 design protocol
+    - simple distriution loss
+    - ProteinMPNN distribution loss
 
 
 Filters

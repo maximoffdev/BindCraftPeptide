@@ -226,33 +226,22 @@ while True:
                     
                     # Compile the binder-target complex prediction model
                     # This model predicts how the MPNN sequence folds when bound to the target
-                    complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings["num_recycles_validation"], data_dir=advanced_settings["af_params_dir"], 
-                                                                use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
-                    
-                    # Choose template mode: use trajectory structure as template OR use original target structure
-                    if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
-                        # Use the designed trajectory structure as starting point (biases prediction toward designed pose)
-                        complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                            rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=True)
-                    else:
-                        # Use only the original target structure (unbiased prediction - tests if sequence really folds to bind)
-                        complex_prediction_model.prep_inputs(pdb_filename=target_settings["starting_pdb"], chain=target_settings["chains"], binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                            rm_target_sc=advanced_settings["rm_template_sc_predict"])
-
-                    # Compile binder-alone prediction model (tests if binder is stable without target)
-                    # This checks for stability and detects if the binder requires the target to fold
-                    binder_prediction_model = mk_afdesign_model(protocol="hallucination", use_templates=False, initial_guess=False, 
-                                                                use_initial_atom_pos=False, num_recycles=advanced_settings["num_recycles_validation"], 
-                                                                data_dir=advanced_settings["af_params_dir"], use_multimer=multimer_validation)
-                    binder_prediction_model.prep_inputs(length=length)
+                    complex_prediction_model, binder_prediction_model = init_prediction_models(
+                        trajectory_pdb=trajectory_pdb,
+                        length=length,
+                        mk_afdesign_model=mk_afdesign_model,
+                        multimer_validation=multimer_validation,
+                        target_settings=target_settings,
+                        advanced_settings=advanced_settings
+                    )
 
                     # === ITERATE OVER MPNN SEQUENCES FOR VALIDATION ===
                     # For each MPNN-designed sequence, predict its structure and calculate quality metrics
                     for mpnn_sequence in mpnn_sequences:
                        
-                        filter_conditions, best_model_pdb, mpnn_data, mpnn_design_name, mpnn_csv = filter_design(
+                        filter_conditions, mpnn_csv, failure_csv, final_csv = filter_design(
                             sequence=mpnn_sequence,
-                            design_name=design_name,
+                            basis_design_name=design_name,
                             design_paths=design_paths,
                             trajectory_pdb=trajectory_pdb,
                             length=length,
@@ -269,73 +258,17 @@ while True:
                             filters_file=filters_file,
                             stats_csv=mpnn_csv,
                             failure_csv=failure_csv,
+                            final_csv=final_csv,
                             complex_prediction_model=complex_prediction_model,
                             binder_prediction_model=binder_prediction_model,
                             is_mpnn_model=True,
                             mpnn_n=mpnn_n
                             )   
-                        if filter_conditions is None:
-                           # Base AF2 filters failed, skip to next MPNN sequence                            
-                            mpnn_n += 1
-                            continue
                         
-                        elif filter_conditions == True:
-                            # === DESIGN PASSED ALL FILTERS - ACCEPT IT ===
-                            print(mpnn_design_name+" passed all filters")
+                        # === DESIGN PASSED FILTERS - ACCEPT IT ===
+                        if filter_conditions == True:
                             accepted_mpnn += 1  # Increment counter for this trajectory
                             accepted_designs += 1  # Increment global counter
-                            
-                            # Copy best model to Accepted folder for easy access
-                            shutil.copy(best_model_pdb, design_paths["Accepted"])
-
-                            # Add to final designs CSV (with empty first column for notes/ranking)
-                            final_data = [''] + mpnn_data
-                            insert_data(final_csv, final_data)
-
-                            # Copy trajectory animation to Accepted folder (if enabled and not already copied)
-                            if advanced_settings["save_design_animations"]:
-                                accepted_animation = os.path.join(design_paths["Accepted/Animation"], f"{design_name}.html")
-                                if not os.path.exists(accepted_animation):
-                                    shutil.copy(os.path.join(design_paths["Trajectory/Animation"], f"{design_name}.html"), accepted_animation)
-
-                            # Copy trajectory loss plots to Accepted folder
-                            plot_files = os.listdir(design_paths["Trajectory/Plots"])
-                            plots_to_copy = [f for f in plot_files if f.startswith(design_name) and f.endswith('.png')]
-                            for accepted_plot in plots_to_copy:
-                                source_plot = os.path.join(design_paths["Trajectory/Plots"], accepted_plot)
-                                target_plot = os.path.join(design_paths["Accepted/Plots"], accepted_plot)
-                                if not os.path.exists(target_plot):
-                                    shutil.copy(source_plot, target_plot)
-
-                        else:
-                            # === DESIGN FAILED FILTERS - REJECT IT ===
-                            print(f"Unmet filter conditions for {mpnn_design_name}")
-                            
-                            # Update failure statistics CSV to track which filters are failing most often
-                            failure_df = pd.read_csv(failure_csv)
-                            
-                            # Handle filter column names that may have model-specific prefixes (Average_, 1_, 2_, etc.)
-                            special_prefixes = ('Average_', '1_', '2_', '3_', '4_', '5_')
-                            incremented_columns = set()  # Track which base columns we've already incremented
-
-                            # For each failed filter, increment its failure count (only once per base metric)
-                            for column in filter_conditions:
-                                base_column = column
-                                # Strip model prefix to get base metric name
-                                for prefix in special_prefixes:
-                                    if column.startswith(prefix):
-                                        base_column = column.split('_', 1)[1]
-
-                                # Only increment each base metric once (even if multiple models failed)
-                                if base_column not in incremented_columns:
-                                    failure_df[base_column] = failure_df[base_column] + 1
-                                    incremented_columns.add(base_column)
-
-                            # Save updated failure counts
-                            failure_df.to_csv(failure_csv, index=False)
-                            
-                            # Move rejected design to Rejected folder for later review
-                            shutil.copy(best_model_pdb, design_paths["Rejected"])
                         
                         # Increment MPNN design counter
                         mpnn_n += 1
@@ -368,6 +301,45 @@ while True:
                 design_time = time.time() - design_start_time
                 design_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(design_time // 3600), int((design_time % 3600) // 60), int(design_time % 60))}"
                 print("Design and validation of trajectory "+design_name+" took: "+design_time_text)
+
+            else:
+                print("MPNN sequence optimization disabled, filtering trajectory directly.")
+                print("")
+
+                complex_prediction_model, binder_prediction_model = init_prediction_models(
+                    trajectory_pdb=trajectory_pdb,
+                    length=length,
+                    mk_afdesign_model=mk_afdesign_model,
+                    multimer_validation=multimer_validation,
+                    target_settings=target_settings,
+                    advanced_settings=advanced_settings
+                )
+
+                filter_conditions, AF2_design_csv, failure_csv, final_csv = filter_design(
+                    sequence=trajectory_sequence,
+                    basis_design_name=design_name,
+                    design_paths=design_paths,
+                    trajectory_pdb=trajectory_pdb,
+                    length=length,
+                    helicity_value=helicity_value,
+                    seed=seed,
+                    prediction_models=prediction_models,
+                    binder_chain=binder_chain,
+                    filters=filters,
+                    design_labels=design_labels,
+                    target_settings=target_settings,
+                    advanced_settings=advanced_settings,
+                    advanced_file=advanced_file,
+                    settings_file=settings_file,
+                    filters_file=filters_file,
+                    stats_csv=AF2_design_csv,
+                    failure_csv=failure_csv,
+                    final_csv=final_csv,
+                    complex_prediction_model=complex_prediction_model,
+                    binder_prediction_model=binder_prediction_model,
+                    is_mpnn_model=False
+                    )                   
+
 
             # === ACCEPTANCE RATE MONITORING ===
             # Check if the design process is too inefficient and should be stopped
