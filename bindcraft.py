@@ -45,11 +45,13 @@ trajectory_labels, design_labels, final_labels = generate_dataframe_labels()
 
 trajectory_csv = os.path.join(target_settings["design_path"], 'trajectory_stats.csv')
 mpnn_csv = os.path.join(target_settings["design_path"], 'mpnn_design_stats.csv')
+AF2_design_csv = os.path.join(target_settings["design_path"], 'AF2_design_stats.csv')
 final_csv = os.path.join(target_settings["design_path"], 'final_design_stats.csv')
 failure_csv = os.path.join(target_settings["design_path"], 'failure_csv.csv')
 
 create_dataframe(trajectory_csv, trajectory_labels)
 create_dataframe(mpnn_csv, design_labels)
+create_dataframe(AF2_design_csv, design_labels)
 create_dataframe(final_csv, final_labels)
 generate_filter_pass_csv(failure_csv, args.filters)
 
@@ -71,7 +73,10 @@ accepted_designs = 0
 ### start design loop
 while True:
     ### check if we have the target number of binders
-    final_designs_reached = check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, advanced_settings, target_settings, design_labels)
+    if advanced_settings["enable_mpnn"]:
+        final_designs_reached = check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, advanced_settings, target_settings, design_labels)
+    else:
+        final_designs_reached = check_accepted_designs(design_paths, AF2_design_csv, final_labels, final_csv, advanced_settings, target_settings, design_labels)
 
     if final_designs_reached:
         # stop design loop execution
@@ -171,7 +176,6 @@ while True:
                 # Initialize counters for tracking MPNN designs
                 mpnn_n = 1  # Counter for numbering each MPNN sequence (e.g., _mpnn1, _mpnn2, etc.)
                 accepted_mpnn = 0  # Track how many MPNN designs pass all filters for this trajectory
-                mpnn_dict = {}  # Dictionary to store MPNN sequence info (seq, score, seqid)
                 design_start_time = time.time()  # Start timer for entire MPNN optimization phase
 
                 ### Generate MPNN redesigned sequences based on the trajectory backbone
@@ -245,198 +249,37 @@ while True:
                     # === ITERATE OVER MPNN SEQUENCES FOR VALIDATION ===
                     # For each MPNN-designed sequence, predict its structure and calculate quality metrics
                     for mpnn_sequence in mpnn_sequences:
-                        mpnn_time = time.time()  # Start timer for this MPNN design
-
-                        # Generate unique name for this MPNN design (e.g., PDL1_l10_s12345_mpnn1)
-                        mpnn_design_name = design_name + "_mpnn" + str(mpnn_n)
-                        mpnn_score = round(mpnn_sequence['score'],2)  # MPNN confidence score
-                        mpnn_seqid = round(mpnn_sequence['seqid'],2)  # Sequence identity to trajectory
-
-                        # Store design info in dictionary for potential later use
-                        mpnn_dict[mpnn_design_name] = {'seq': mpnn_sequence['seq'], 'score': mpnn_score, 'seqid': mpnn_seqid}
-
-                        # Optionally save sequence in FASTA format
-                        if advanced_settings["save_mpnn_fasta"] is True:
-                            save_fasta(mpnn_design_name, mpnn_sequence['seq'], design_paths)
-                        
-                        ### === PREDICT BINDER-TARGET COMPLEX ===
-                        # predict_binder_complex: Runs AF2 prediction on MPNN sequence bound to target
-                        #   - Predicts with multiple AF2 model weights (usually models 1 and 2)
-                        #   - Applies early AF2-based filters (pLDDT, pTM, iPTM, pAE, etc.)
-                        #   - Returns statistics dict and pass/fail boolean
-                        mpnn_complex_statistics, pass_af2_filters = predict_binder_complex(complex_prediction_model,
-                                                                                        mpnn_sequence['seq'], mpnn_design_name,
-                                                                                        target_settings["starting_pdb"], target_settings["chains"],
-                                                                                        length, trajectory_pdb, prediction_models, advanced_settings,
-                                                                                        filters, design_paths, failure_csv)
-
-                        # If basic AF2 quality filters failed, skip expensive interface scoring and move to next sequence
-                        if not pass_af2_filters:
-                            print(f"Base AF2 filters not passed for {mpnn_design_name}, skipping interface scoring")
+                       
+                        filter_conditions, best_model_pdb, mpnn_data, mpnn_design_name, mpnn_csv = filter_design(
+                            sequence=mpnn_sequence,
+                            design_name=design_name,
+                            design_paths=design_paths,
+                            trajectory_pdb=trajectory_pdb,
+                            length=length,
+                            helicity_value=helicity_value,
+                            seed=seed,
+                            prediction_models=prediction_models,
+                            binder_chain=binder_chain,
+                            filters=filters,
+                            design_labels=design_labels,
+                            target_settings=target_settings,
+                            advanced_settings=advanced_settings,
+                            advanced_file=advanced_file,
+                            settings_file=settings_file,
+                            filters_file=filters_file,
+                            stats_csv=mpnn_csv,
+                            failure_csv=failure_csv,
+                            complex_prediction_model=complex_prediction_model,
+                            binder_prediction_model=binder_prediction_model,
+                            is_mpnn_model=True,
+                            mpnn_n=mpnn_n
+                            )   
+                        if filter_conditions is None:
+                           # Base AF2 filters failed, skip to next MPNN sequence                            
                             mpnn_n += 1
                             continue
-
-                        # === CALCULATE DETAILED INTERFACE METRICS FOR EACH AF2 MODEL ===
-                        # For each AF2 model weight used in prediction, calculate detailed structural properties
-                        for model_num in prediction_models:
-                            # Paths to unrelaxed and relaxed (energy-minimized) structures
-                            mpnn_design_pdb = os.path.join(design_paths["MPNN"], f"{mpnn_design_name}_model{model_num+1}.pdb")
-                            mpnn_design_relaxed = os.path.join(design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{model_num+1}.pdb")
-
-                            if os.path.exists(mpnn_design_pdb):
-                                # Calculate atomic clashes (too-close atoms) before and after energy minimization
-                                # Clashes indicate structural problems or packing defects
-                                num_clashes_mpnn = calculate_clash_score(mpnn_design_pdb)
-                                num_clashes_mpnn_relaxed = calculate_clash_score(mpnn_design_relaxed)
-
-                                # score_interface: PyRosetta-based comprehensive interface analysis
-                                #   Returns binding energy (dG), shape complementarity, hydrophobicity, hydrogen bonds, etc.
-                                #   Also returns which amino acids are at the interface
-                                mpnn_interface_scores, mpnn_interface_AA, mpnn_interface_residues = score_interface(mpnn_design_relaxed, binder_chain)
-
-                                # calc_ss_percentage: Analyze secondary structure content (helix/sheet/loop percentages)
-                                #   Uses DSSP to assign secondary structure
-                                #   Returns overall percentages and interface-specific percentages, plus pLDDT values
-                                mpnn_alpha, mpnn_beta, mpnn_loops, mpnn_alpha_interface, mpnn_beta_interface, mpnn_loops_interface, mpnn_i_plddt, mpnn_ss_plddt = calc_ss_percentage(mpnn_design_pdb, advanced_settings, binder_chain)
-                                
-                                # Calculate RMSD of binder to original trajectory (tests if it stayed in designed binding site)
-                                # Unaligned RMSD measures overall structural similarity without fitting
-                                rmsd_site = unaligned_rmsd(trajectory_pdb, mpnn_design_pdb, binder_chain, binder_chain)
-
-                                # Calculate how much the target structure moved from its starting conformation
-                                # Large values indicate the target is being distorted, which is usually bad
-                                target_rmsd = target_pdb_rmsd(mpnn_design_pdb, target_settings["starting_pdb"], target_settings["chains"])
-
-                                # Add all calculated metrics to the statistics dictionary for this model
-                                mpnn_complex_statistics[model_num+1].update({
-                                    'i_pLDDT': mpnn_i_plddt,  # Average pLDDT of interface residues
-                                    'ss_pLDDT': mpnn_ss_plddt,  # pLDDT weighted by secondary structure
-                                    'Unrelaxed_Clashes': num_clashes_mpnn,
-                                    'Relaxed_Clashes': num_clashes_mpnn_relaxed,
-                                    'Binder_Energy_Score': mpnn_interface_scores['binder_score'],
-                                    'Surface_Hydrophobicity': mpnn_interface_scores['surface_hydrophobicity'],
-                                    'ShapeComplementarity': mpnn_interface_scores['interface_sc'],  # How well surfaces fit (0-1)
-                                    'PackStat': mpnn_interface_scores['interface_packstat'],  # Packing quality (0-1)
-                                    'dG': mpnn_interface_scores['interface_dG'],  # Binding energy (negative = favorable)
-                                    'dSASA': mpnn_interface_scores['interface_dSASA'],  # Buried surface area
-                                    'dG/dSASA': mpnn_interface_scores['interface_dG_SASA_ratio'],  # Energy per buried area
-                                    'Interface_SASA_%': mpnn_interface_scores['interface_fraction'],
-                                    'Interface_Hydrophobicity': mpnn_interface_scores['interface_hydrophobicity'],
-                                    'n_InterfaceResidues': mpnn_interface_scores['interface_nres'],
-                                    'n_InterfaceHbonds': mpnn_interface_scores['interface_interface_hbonds'],
-                                    'InterfaceHbondsPercentage': mpnn_interface_scores['interface_hbond_percentage'],
-                                    'n_InterfaceUnsatHbonds': mpnn_interface_scores['interface_delta_unsat_hbonds'],  # Unsatisfied H-bonds (bad)
-                                    'InterfaceUnsatHbondsPercentage': mpnn_interface_scores['interface_delta_unsat_hbonds_percentage'],
-                                    'InterfaceAAs': mpnn_interface_AA,  # Amino acid composition at interface
-                                    'Interface_Helix%': mpnn_alpha_interface,
-                                    'Interface_BetaSheet%': mpnn_beta_interface,
-                                    'Interface_Loop%': mpnn_loops_interface,
-                                    'Binder_Helix%': mpnn_alpha,
-                                    'Binder_BetaSheet%': mpnn_beta,
-                                    'Binder_Loop%': mpnn_loops,
-                                    'Hotspot_RMSD': rmsd_site,  # Deviation from designed binding site
-                                    'Target_RMSD': target_rmsd  # Target backbone deviation
-                                })
-
-                                # Clean up: Remove unrelaxed PDB to save disk space (keep only relaxed version)
-                                if advanced_settings["remove_unrelaxed_complex"]:
-                                    os.remove(mpnn_design_pdb)
-
-                        # === CALCULATE AVERAGE METRICS ACROSS ALL AF2 MODELS ===
-                        # calculate_averages: Averages metrics from all predicted models (typically 2 models)
-                        #   Provides consensus estimate of binder quality
-                        #   handle_aa=True means it also averages amino acid composition
-                        mpnn_complex_averages = calculate_averages(mpnn_complex_statistics, handle_aa=True)
                         
-                        ### === PREDICT BINDER ALONE (WITHOUT TARGET) ===
-                        # Tests if binder is stable on its own or requires target to fold properly
-                        # predict_binder_alone: Runs AF2 in hallucination mode (no template) with just binder sequence
-                        #   Returns structure quality metrics (pLDDT, pTM, pAE)
-                        binder_statistics = predict_binder_alone(binder_prediction_model, mpnn_sequence['seq'], mpnn_design_name, length,
-                                                                trajectory_pdb, binder_chain, prediction_models, advanced_settings, design_paths)
-
-                        # === CALCULATE BINDER-ALONE RMSD TO TRAJECTORY ===
-                        # Check how much the binder structure changes when target is removed
-                        # Large RMSD indicates binder is not stable alone (requires target to fold)
-                        for model_num in prediction_models:
-                            mpnn_binder_pdb = os.path.join(design_paths["MPNN/Binder"], f"{mpnn_design_name}_model{model_num+1}.pdb")
-
-                            if os.path.exists(mpnn_binder_pdb):
-                                # Compare standalone binder structure to trajectory binder structure
-                                rmsd_binder = unaligned_rmsd(trajectory_pdb, mpnn_binder_pdb, binder_chain, "A")
-
-                            # Add RMSD to statistics
-                            binder_statistics[model_num+1].update({
-                                    'Binder_RMSD': rmsd_binder
-                                })
-
-                            # Clean up: Remove binder monomer PDBs to save space
-                            if advanced_settings["remove_binder_monomer"]:
-                                os.remove(mpnn_binder_pdb)
-
-                        # Calculate average binder-alone metrics across models
-                        binder_averages = calculate_averages(binder_statistics)
-
-                        # === SEQUENCE VALIDATION ===
-                        # validate_design_sequence: Checks sequence for potential experimental issues:
-                        #   - Contains residues that absorb UV (for concentration measurement: W, Y, F)
-                        #   - Avoids cysteines if specified (can form unwanted disulfides)
-                        #   - Checks for unusual amino acid patterns
-                        seq_notes = validate_design_sequence(mpnn_sequence['seq'], mpnn_complex_averages.get('Relaxed_Clashes', None), advanced_settings)
-
-                        # Calculate time spent on this MPNN design
-                        mpnn_end_time = time.time() - mpnn_time
-                        elapsed_mpnn_text = f"{'%d hours, %d minutes, %d seconds' % (int(mpnn_end_time // 3600), int((mpnn_end_time % 3600) // 60), int(mpnn_end_time % 60))}"
-
-
-                        # === PREPARE DATA FOR CSV OUTPUT ===
-                        # Build a comprehensive row of data with averages and individual model results
-                        # Insert statistics about MPNN design into CSV, will return None if corresponding model does note exist
-                        model_numbers = range(1, 6)  # Support up to 5 AF2 models (usually only 2 are used)
-                        statistics_labels = ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'i_pLDDT', 'ss_pLDDT', 'Unrelaxed_Clashes', 'Relaxed_Clashes', 'Binder_Energy_Score', 'Surface_Hydrophobicity',
-                                            'ShapeComplementarity', 'PackStat', 'dG', 'dSASA', 'dG/dSASA', 'Interface_SASA_%', 'Interface_Hydrophobicity', 'n_InterfaceResidues', 'n_InterfaceHbonds', 'InterfaceHbondsPercentage',
-                                            'n_InterfaceUnsatHbonds', 'InterfaceUnsatHbondsPercentage', 'Interface_Helix%', 'Interface_BetaSheet%', 'Interface_Loop%', 'Binder_Helix%',
-                                            'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Hotspot_RMSD', 'Target_RMSD']
-
-                        # Start with basic design metadata
-                        mpnn_data = [mpnn_design_name, advanced_settings["design_algorithm"], length, seed, helicity_value, target_settings["target_hotspot_residues"], mpnn_sequence['seq'], mpnn_interface_residues, mpnn_score, mpnn_seqid]
-
-                        # Add complex statistics: first average, then individual models (1-5)
-                        for label in statistics_labels:
-                            mpnn_data.append(mpnn_complex_averages.get(label, None))  # Average value
-                            for model in model_numbers:
-                                mpnn_data.append(mpnn_complex_statistics.get(model, {}).get(label, None))  # Model-specific value
-
-                        # Add binder-alone statistics: average + individual models
-                        for label in ['pLDDT', 'pTM', 'pAE', 'Binder_RMSD']:  # These are the labels for binder alone
-                            mpnn_data.append(binder_averages.get(label, None))
-                            for model in model_numbers:
-                                mpnn_data.append(binder_statistics.get(model, {}).get(label, None))
-
-                        # Add metadata: timing, sequence notes, settings used
-                        mpnn_data.extend([elapsed_mpnn_text, seq_notes, settings_file, filters_file, advanced_file])
-
-                        # Write data row to CSV
-                        insert_data(mpnn_csv, mpnn_data)
-
-                        # === SELECT BEST MODEL BY PLDDT ===
-                        # Find which AF2 model produced the highest-confidence prediction
-                        # CSV indices 11-14 contain pLDDT values for models 1-4 (after Average_pLDDT at index 10)
-                        plddt_values = {i: mpnn_data[i] for i in range(11, 15) if mpnn_data[i] is not None}
-
-                        # Find the index with the highest pLDDT value
-                        highest_plddt_key = int(max(plddt_values, key=plddt_values.get))
-
-                        # Convert index to model number (11->1, 12->2, etc.)
-                        best_model_number = highest_plddt_key - 10
-                        best_model_pdb = os.path.join(design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{best_model_number}.pdb")
-
-                        # === APPLY QUALITY FILTERS ===
-                        # check_filters: Compares all calculated metrics against user-defined thresholds
-                        #   Returns True if all filters passed, or list of failed filters
-                        #   Filters can include thresholds for pLDDT, binding energy, clashes, etc.
-                        filter_conditions = check_filters(mpnn_data, design_labels, filters)
-                        if filter_conditions == True:
+                        elif filter_conditions == True:
                             # === DESIGN PASSED ALL FILTERS - ACCEPT IT ===
                             print(mpnn_design_name+" passed all filters")
                             accepted_mpnn += 1  # Increment counter for this trajectory

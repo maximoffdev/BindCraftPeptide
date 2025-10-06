@@ -137,7 +137,7 @@ def check_n_trajectories(design_paths, advanced_settings):
         return False
 
 # Check if we have required number of accepted targets, rank them, and analyse sequence and structure properties
-def check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, advanced_settings, target_settings, design_labels):
+def check_accepted_designs(design_paths, filtered_csv, final_labels, final_csv, advanced_settings, target_settings, design_labels):
     accepted_binders = [f for f in os.listdir(design_paths["Accepted"]) if f.endswith('.pdb') and not f.startswith('.')]
 
     if len(accepted_binders) >= target_settings["number_of_final_designs"]:
@@ -148,7 +148,7 @@ def check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, adva
             os.remove(os.path.join(design_paths["Accepted/Ranked"], f))
 
         # load dataframe of designed binders
-        design_df = pd.read_csv(mpnn_csv)
+        design_df = pd.read_csv(filtered_csv)
         design_df = design_df.sort_values('Average_i_pTM', ascending=False)
         
         # create final csv dataframe to copy matched rows, initialize with the column labels

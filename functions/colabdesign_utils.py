@@ -153,7 +153,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
         initial_plddt = get_best_plddt(af_model, length)
         
         # if best iteration has high enough confidence then continue
-        if initial_plddt > 0.65:
+        if initial_plddt > advanced_settings.get("initial_plddt", 0.65):
             print("Initial trajectory pLDDT good, continuing: "+str(initial_plddt))
             if advanced_settings["optimise_beta"]:
                 # temporarily dump model to assess secondary structure
@@ -192,7 +192,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
                 softmax_plddt = logit_plddt
 
             # perform one hot encoding
-            if softmax_plddt > 0.65:
+            if softmax_plddt > advanced_settings.get("softmax_plddt", 0.65):
                 print("Softmax trajectory pLDDT good, continuing: "+str(softmax_plddt))
                 onehot_plddt = softmax_plddt
                 if advanced_settings["hard_iterations"] > 0:
@@ -202,7 +202,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
                                     sample_models=advanced_settings["sample_models"], dropout=False, ramp_recycles=False, save_best=True)
                     onehot_plddt = get_best_plddt(af_model, length)
 
-                if onehot_plddt > 0.65:
+                if onehot_plddt > advanced_settings.get("onehot_plddt", 0.65):
                     # perform greedy mutation optimisation
                     print("One-hot trajectory pLDDT good, continuing: "+str(onehot_plddt))
                     if advanced_settings["greedy_iterations"] > 0:
@@ -229,6 +229,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
 
     ### save trajectory PDB
     final_plddt = get_best_plddt(af_model, length)
+    final_iptm = get_best_iptm(af_model)
     af_model.save_pdb(model_pdb_path)
     af_model.aux["log"]["terminate"] = ""
 
@@ -245,10 +246,15 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
         print("")
     else:
         # check if low quality prediction
-        if final_plddt < 0.7:
+        if final_plddt < advanced_settings.get("final_plddt", 0.70):
             af_model.aux["log"]["terminate"] = "LowConfidence"
             update_failures(failure_csv, 'Trajectory_final_pLDDT')
-            print("Trajectory starting confidence low, skipping analysis and MPNN optimisation")
+            print(f"Trajectory starting confidence low, final pLDDT: {round(final_plddt, 2)}, threshold: {advanced_settings.get('final_plddt', 0.70)}, skipping analysis and MPNN optimisation")
+            print("")
+        elif final_iptm < advanced_settings.get("final_iptm", 0.50):
+            af_model.aux["log"]["terminate"] = "LowConfidence"
+            update_failures(failure_csv, 'Trajectory_final_iPTM')
+            print(f"Trajectory starting interface confidence low, final iPTM: {round(final_iptm, 2)}, threshold: {advanced_settings.get('final_iptm', 0.50)}, skipping analysis and MPNN optimisation")
             print("")
         else:
             # does it have enough contacts to consider?
@@ -442,6 +448,10 @@ def mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residue
 # Get pLDDT of best model
 def get_best_plddt(af_model, length):
     return round(np.mean(af_model._tmp["best"]["aux"]["plddt"][-length:]),2)
+
+# Get iptm of best model
+def get_best_iptm(af_model):
+    return round(af_model._tmp["best"]["aux"]["i_ptm"],2)
 
 # Define radius of gyration loss for colabdesign
 def add_rg_loss(self, weight=0.1):
