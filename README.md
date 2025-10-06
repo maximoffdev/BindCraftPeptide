@@ -208,3 +208,15 @@ Thanks to Lennart Nickel, Yehlin Cho, Casper Goverde, and Sergey Ovchinnikov for
  <li>Justas Dauparas's ProteinMPNN (https://github.com/dauparas/ProteinMPNN)</li>
  <li>PyRosetta (https://github.com/RosettaCommons/PyRosetta.notebooks)</li>
 </ul>
+
+## Docker command execution
+
+docker run --rm -it --gpus all \
+  -v "$(pwd)":/workspace -w /workspace \
+  -p 8890:8888 \
+  -v "$(pwd)/.cache/matplotlib":/mplcache -e MPLCONFIGDIR=/mplcache \
+  bindcraft-gpu:custom \
+  python -u ./bindcraft.py \
+    --settings './example/c5/c5.json' \
+    --filters './settings_filters/default_filters.json' \
+    --advanced './settings_advanced/betasheet_4stage_multimer_flexible.json'

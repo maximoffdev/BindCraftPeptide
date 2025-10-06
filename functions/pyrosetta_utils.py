@@ -9,6 +9,9 @@ from pyrosetta.rosetta.core.select.residue_selector import ChainSelector
 from pyrosetta.rosetta.protocols.simple_moves import AlignChainMover
 from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
 from pyrosetta.rosetta.protocols.relax import FastRelax
+from pyrosetta.rosetta.protocols.denovo_design import DisulfidizeMover
+from pyrosetta.rosetta.core.pack.task import TaskFactory
+from pyrosetta.rosetta.core.pack.task.operation import RestrictToRepacking
 from pyrosetta.rosetta.core.simple_metrics.metrics import RMSDMetric
 from pyrosetta.rosetta.core.select import get_residues_from_subset
 from pyrosetta.rosetta.core.io import pose_from_pose
@@ -241,3 +244,54 @@ def pr_relax(pdb_file, relaxed_pdb_path):
         # output relaxed and aligned PDB
         pose.dump_pdb(relaxed_pdb_path)
         clean_pdb(relaxed_pdb_path)
+
+    # Create disulfide bonds in binder chain and minimize
+    def pr_staple_disulfides(pdb_in, pdb_out, binder_chain, binder_local_pairs):
+        # Load pose
+        pose = pr.pose_from_pdb(pdb_in)
+
+        # Map binder-local indices (0-based) to pose residue indices (1-based)
+        chain_sel = ChainSelector(binder_chain)
+        subset = chain_sel.apply(pose)
+        binder_indices = pr.rosetta.core.select.get_residues_from_subset(subset)
+        if len(binder_indices) == 0:
+            # nothing to do
+            return False
+
+        # Build mapping: local 0..n-1 -> pose index
+        # binder_indices is a utility::vector1<Size>; convert to list
+        binder_pose_idxs = [binder_indices[i] for i in range(1, len(binder_indices)+1)]
+
+        disulfidizer = DisulfidizeMover()
+        disulfidizer.set_match_rt_limit(999.0)
+        disulfidizer.set_max_disulf_score(999.0)
+
+        scorefxn = pr.get_fa_scorefxn()
+
+        # Apply disulfides
+        for (i, j) in binder_local_pairs or []:
+            if i < 0 or j < 0 or i >= len(binder_pose_idxs) or j >= len(binder_pose_idxs):
+                continue
+            res1 = binder_pose_idxs[i]
+            res2 = binder_pose_idxs[j]
+            # residues are 1-based already; ensure order
+            if res1 == res2:
+                continue
+            disulfidizer.make_disulfide(pose, int(res1), int(res2), False, scorefxn)
+
+        # Minimize with FastRelax (restrained)
+        mmf = MoveMap()
+        mmf.set_chi(True)
+        mmf.set_bb(True)
+        mmf.set_jump(False)
+        fr = FastRelax()
+        fr.set_scorefxn(scorefxn)
+        fr.set_movemap(mmf)
+        fr.max_iter(200)
+        fr.min_type("lbfgs_armijo_nonmonotone")
+        fr.constrain_relax_to_start_coords(True)
+        fr.apply(pose)
+
+        pose.dump_pdb(pdb_out)
+        clean_pdb(pdb_out)
+        return True

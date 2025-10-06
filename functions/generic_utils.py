@@ -11,6 +11,9 @@ import random
 import math
 import pandas as pd
 import numpy as np
+import subprocess
+import tempfile
+import errno
 
 # Define labels for dataframes
 def generate_dataframe_labels():
@@ -245,14 +248,93 @@ def perform_advanced_settings_check(advanced_settings, bindcraft_folder):
         if not advanced_settings["dalphaball_path"]:
             advanced_settings["dalphaball_path"] = os.path.join(bindcraft_folder, 'functions', 'DAlphaBall.gcc')
 
+    # Ensure external tools are executable and reachable
+    advanced_settings["dssp_path"] = _resolve_executable(
+        preferred_path=advanced_settings.get("dssp_path", ""),
+        tool_names=["mkdssp", "dssp"],
+        copy_basename="dssp"
+    )
+    advanced_settings["dalphaball_path"] = _resolve_executable(
+        preferred_path=advanced_settings.get("dalphaball_path", ""),
+        tool_names=["DAlphaBall.gcc"],
+        copy_basename="DAlphaBall.gcc"
+    )
+
     # check formatting of omit_AAs setting
-        omit_aas = advanced_settings["omit_AAs"]
     if advanced_settings["omit_AAs"] in [None, False, '']:
         advanced_settings["omit_AAs"] = None
     elif isinstance(advanced_settings["omit_AAs"], str):
         advanced_settings["omit_AAs"] = advanced_settings["omit_AAs"].strip()
 
     return advanced_settings
+
+
+def _resolve_executable(preferred_path: str, tool_names: list, copy_basename: str) -> str:
+    """
+    Return a path to an executable we can run inside the current environment.
+    Strategy:
+    1) If preferred_path exists and is runnable, return it.
+    2) Else, try to locate a tool by name on PATH (e.g., mkdssp).
+    3) Else, if preferred_path exists but is not executable (e.g., bind-mount with noexec),
+       copy it into a temp dir and chmod +x, then return the temp copy.
+    """
+    # 1) If preferred path is provided and works, use it
+    if preferred_path and os.path.isfile(preferred_path):
+        if _is_executable(preferred_path):
+            return preferred_path
+        # Try copying to a temp location in case mount is noexec
+        tmp_path = _copy_to_exec_tmp(preferred_path, copy_basename)
+        if tmp_path:
+            return tmp_path
+
+    # 2) Try to find a system-provided executable by name
+    for name in tool_names:
+        found = shutil.which(name)
+        if found and _is_executable(found):
+            return found
+
+    # 3) If we still have a preferred_path, attempt final copy to temp
+    if preferred_path and os.path.isfile(preferred_path):
+        tmp_path = _copy_to_exec_tmp(preferred_path, copy_basename)
+        if tmp_path:
+            return tmp_path
+
+    # As a last resort, return the original path (may still error, but keeps prior behavior)
+    return preferred_path
+
+
+def _is_executable(path: str) -> bool:
+    """Check if a path is executable by attempting '--version' and checking x-bit."""
+    if not os.access(path, os.X_OK):
+        return False
+    try:
+        subprocess.check_output([path, "--version"], stderr=subprocess.STDOUT, text=True, timeout=5)
+        return True
+    except subprocess.CalledProcessError:
+        # Non-zero exit is fine; we only care that exec succeeded
+        return True
+    except PermissionError as e:
+        # EACCES typically indicates noexec mount or lacking perms
+        if getattr(e, 'errno', None) == errno.EACCES:
+            return False
+        return False
+    except Exception:
+        # Any other error means we at least could execute; accept path
+        return True
+
+
+def _copy_to_exec_tmp(src_path: str, basename: str) -> str:
+    """Copy a binary to a temp directory and make it executable. Returns new path or '' on failure."""
+    try:
+        tmp_dir = tempfile.gettempdir()
+        dst = os.path.join(tmp_dir, basename)
+        # Avoid redundant copies
+        if os.path.abspath(src_path) != os.path.abspath(dst):
+            shutil.copy2(src_path, dst)
+        os.chmod(dst, 0o755)
+        return dst
+    except Exception:
+        return ""
 
 # Load settings from JSONs
 def load_json_settings(settings_json, filters_json, advanced_json):

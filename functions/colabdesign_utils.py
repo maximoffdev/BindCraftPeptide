@@ -2,11 +2,12 @@
 ############## ColabDesign functions
 ####################################
 ### Import dependencies
-import os, re, shutil, math, pickle
+import os, re, shutil, math, pickle, random
 import matplotlib.pyplot as plt
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax.lax import dynamic_slice
 from scipy.special import softmax
 from colabdesign import mk_afdesign_model, clear_mem
 from colabdesign.mpnn import mk_mpnn_model
@@ -15,6 +16,7 @@ from colabdesign.af.loss import get_ptm, mask_loss, get_dgram_bins, _get_con_los
 from colabdesign.shared.utils import copy_dict
 from .biopython_utils import hotspot_residues, calculate_clash_score, calc_ss_percentage, calculate_percentages
 from .pyrosetta_utils import pr_relax, align_pdbs
+from . import pyrosetta_utils as pr_utils
 from .generic_utils import update_failures
 
 # hallucinate a binder
@@ -61,6 +63,57 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
     if advanced_settings["use_termini_distance_loss"]:
         # termini distance loss
         add_termini_distance_loss(af_model, advanced_settings["weights_termini_loss"])
+
+    # optionally add disulfide promotion loss and seed cysteines
+    if advanced_settings.get("use_disulfide_loss", False):
+        # determine disulfide pairs (binder-local 0-based indices)
+        ds_pairs = advanced_settings.get("disulfide_pairs")
+        if not ds_pairs or len(ds_pairs) == 0:
+            # auto-generate pattern
+            ds_pairs, sequence_pattern, _ = generate_disulfide_pattern(length, 
+                                                                       advanced_settings.get("disulfide_num", 1), 
+                                                                       advanced_settings.get("disulfide_min_sep", 5))
+        else:
+            # validate provided pairs and build sequence pattern
+            valid = True
+            seen = set()
+            for (i, j) in ds_pairs:
+                if i == j or i < 0 or j < 0 or i >= length or j >= length:
+                    valid = False
+                    break
+                if abs(i - j) < advanced_settings.get("disulfide_min_sep", 5):
+                    valid = False
+                    break
+                if i in seen or j in seen:
+                    valid = False
+                    break
+                seen.add(i); seen.add(j)
+            if not valid:
+                # fall back to auto-generation
+                ds_pairs, sequence_pattern, _ = generate_disulfide_pattern(length, 
+                                                                           advanced_settings.get("disulfide_num", 1), 
+                                                                           advanced_settings.get("disulfide_min_sep", 5))
+            else:
+                # construct binder-only sequence pattern with Cs
+                sp = ["X"] * length
+                for i, j in ds_pairs:
+                    sp[i] = "C"; sp[j] = "C"
+                sequence_pattern = "".join(sp)
+
+        if ds_pairs and len(ds_pairs) > 0:
+            # seed sequence and restrict additional cysteines
+            try:
+                af_model.restart(seq=sequence_pattern, add_seq=True, rm_aa='C')
+            except Exception:
+                # if restart fails (API differences), continue without seeding
+                pass
+            # store pattern for loss and downstream stapling
+            af_model.opt["disulfide_pattern"] = ds_pairs
+            advanced_settings["disulfide_pairs_runtime"] = ds_pairs
+            # register loss
+            add_disulfide_loss(af_model, 
+                               weight=advanced_settings.get("weights_disulfide", 1.0), 
+                               cutoff=advanced_settings.get("disulfide_cutoff", 7.0))
 
     # add the helicity loss
     add_helix_loss(af_model, helicity_value)
@@ -141,6 +194,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
             # perform one hot encoding
             if softmax_plddt > 0.65:
                 print("Softmax trajectory pLDDT good, continuing: "+str(softmax_plddt))
+                onehot_plddt = softmax_plddt
                 if advanced_settings["hard_iterations"] > 0:
                     af_model.clear_best()
                     print("Stage 3: One-hot Optimisation")
@@ -298,6 +352,18 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
         if pass_af2_filters:
             mpnn_relaxed = os.path.join(design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{model_num+1}.pdb")
             pr_relax(complex_pdb, mpnn_relaxed)
+            # optional: staple disulfides in the binder chain after relaxation
+            if advanced_settings.get("use_disulfide_loss", False):
+                binder_chain = advanced_settings.get("binder_chain", "B")
+                pairs = advanced_settings.get("disulfide_pairs_runtime") or advanced_settings.get("disulfide_pairs")
+                if pairs:
+                    stapled_out = os.path.join(design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{model_num+1}_stapled.pdb")
+                    try:
+                        _staple = getattr(pr_utils, "pr_staple_disulfides", None)
+                        if _staple:
+                            _staple(mpnn_relaxed, stapled_out, binder_chain, pairs)
+                    except Exception:
+                        pass
         else:
             if os.path.exists(complex_pdb):
                 os.remove(complex_pdb)
@@ -324,6 +390,18 @@ def predict_binder_alone(prediction_model, binder_sequence, mpnn_design_name, le
 
             # align binder model to trajectory binder
             align_pdbs(trajectory_pdb, binder_alone_pdb, binder_chain, "A")
+
+            # optional: staple disulfides on binder-alone models
+            if advanced_settings.get("use_disulfide_loss", False):
+                pairs = advanced_settings.get("disulfide_pairs_runtime") or advanced_settings.get("disulfide_pairs")
+                if pairs:
+                    stapled_out = os.path.join(design_paths["MPNN/Binder"], f"{mpnn_design_name}_model{model_num+1}_stapled.pdb")
+                    try:
+                        _staple = getattr(pr_utils, "pr_staple_disulfides", None)
+                        if _staple:
+                            _staple(binder_alone_pdb, stapled_out, binder_chain, pairs)
+                    except Exception:
+                        pass
 
             # extract the statistics for the model
             stats = {
@@ -393,31 +471,39 @@ def add_i_ptm_loss(self, weight=0.1):
 
 # add helicity loss
 def add_helix_loss(self, weight=0):
-    def binder_helicity(inputs, outputs):  
-      if "offset" in inputs:
-        offset = inputs["offset"]
-      else:
-        idx = inputs["residue_index"].flatten()
-        offset = idx[:,None] - idx[None,:]
-
-      # define distogram
-      dgram = outputs["distogram"]["logits"]
-      dgram_bins = get_dgram_bins(outputs)
-      mask_2d = np.outer(np.append(np.zeros(self._target_len), np.ones(self._binder_len)), np.append(np.zeros(self._target_len), np.ones(self._binder_len)))
-
-      x = _get_con_loss(dgram, dgram_bins, cutoff=6.0, binary=True)
-      if offset is None:
-        if mask_2d is None:
-          helix_loss = jnp.diagonal(x,3).mean()
+    def binder_helicity(inputs, outputs):
+        if "offset" in inputs:
+            offset = inputs["offset"]
         else:
-          helix_loss = jnp.diagonal(x * mask_2d,3).sum() + (jnp.diagonal(mask_2d,3).sum() + 1e-8)
-      else:
-        mask = offset == 3
-        if mask_2d is not None:
-          mask = jnp.where(mask_2d,mask,0)
-        helix_loss = jnp.where(mask,x,0.0).sum() / (mask.sum() + 1e-8)
+            idx = inputs["residue_index"].flatten()
+            offset = idx[:, None] - idx[None, :]
 
-      return {"helix":helix_loss}
+        # define distogram
+        dgram = outputs["distogram"]["logits"]
+        dgram_bins = get_dgram_bins(outputs)
+        mask_2d = np.outer(
+            np.append(np.zeros(self._target_len), np.ones(self._binder_len)),
+            np.append(np.zeros(self._target_len), np.ones(self._binder_len)),
+        )
+
+        x = _get_con_loss(dgram, dgram_bins, cutoff=6.0, binary=True)
+        if offset is None:
+            if mask_2d is None:
+                helix_loss = jnp.diagonal(x, 3).mean()
+            else:
+                helix_loss = jnp.diagonal(x * mask_2d, 3).sum() + (jnp.diagonal(mask_2d, 3).sum() + 1e-8)
+        else:
+            mask = offset == 3
+            # ensure boolean mask
+            mask = jnp.asarray(mask, dtype=bool)
+            if mask_2d is not None:
+                mask2 = jnp.asarray(mask_2d.astype(bool))
+                mask = jnp.logical_and(mask2, mask)
+            x_arr = jnp.asarray(x)
+            x_masked = jnp.where(mask, x_arr, 0.0)
+            helix_loss = jnp.sum(x_masked) / (jnp.sum(mask) + 1e-8)
+
+        return {"helix": helix_loss}
     self._callbacks["model"]["loss"].append(binder_helicity)
     self.opt["weights"]["helix"] = weight
 
@@ -447,9 +533,60 @@ def add_termini_distance_loss(self, weight=0.1, threshold_distance=7.0):
     self._callbacks["model"]["loss"].append(loss_fn)
     self.opt["weights"]["NC"] = weight
 
+# generate disulfide pattern and sequence pattern for binder
+def generate_disulfide_pattern(L, disulfide_num, min_sep=5):
+    disulfide_pattern = []
+    positions = list(range(L))
+    trials = 0
+    while len(disulfide_pattern) < disulfide_num and trials < 1000:
+        trials += 1
+        if len(positions) < 2:
+            break
+        i, j = sorted(random.sample(positions, k=2))
+        if abs(i - j) < min_sep:
+            continue
+        positions.remove(i)
+        positions.remove(j)
+        disulfide_pattern.append((i, j))
+    sequence_pattern = list('X' * L)
+    for (i, j) in disulfide_pattern:
+        sequence_pattern[i] = 'C'; sequence_pattern[j] = 'C'
+    return disulfide_pattern, ''.join(sequence_pattern), L
+
+# add disulfide promotion loss
+def add_disulfide_loss(self, weight=1.0, cutoff=7.0):
+    def loss_fn(inputs, outputs):
+        pairs = self.opt.get("disulfide_pattern", [])
+        if pairs is None or len(pairs) == 0:
+            return {"disulfide": jnp.array(0.0)}
+
+        dgram = outputs["distogram"]["logits"]
+        dgram_bins = get_dgram_bins(outputs)
+
+        loss_val = 0.0
+        n = 0
+        for (i, j) in pairs:
+            # map binder-local to global indices (target first, binder last)
+            gi = int(self._target_len + i)
+            gj = int(self._target_len + j)
+            # symmetric pair distance histograms (1x1xB)
+            dg_ij = dynamic_slice(dgram, (gi, gj, 0), (1, 1, dgram.shape[-1]))
+            dg_ji = dynamic_slice(dgram, (gj, gi, 0), (1, 1, dgram.shape[-1]))
+            pair_dgram = dg_ij + dg_ji
+            # convert to contact loss at cutoff
+            x = _get_con_loss(pair_dgram, dgram_bins, cutoff=cutoff, binary=False)
+            loss_val += x.sum()
+            n += 1
+
+        return {"disulfide": loss_val / (n + 1e-8)}
+
+    self._callbacks["model"]["loss"].append(loss_fn)
+    self.opt["weights"]["disulfide"] = weight
+    self.opt["disulfide_cutoff"] = cutoff
+
 # plot design trajectory losses
 def plot_trajectory(af_model, design_name, design_paths):
-    metrics_to_plot = ['loss', 'plddt', 'ptm', 'i_ptm', 'con', 'i_con', 'pae', 'i_pae', 'rg', 'mpnn']
+    metrics_to_plot = ['loss', 'plddt', 'ptm', 'i_ptm', 'con', 'i_con', 'pae', 'i_pae', 'rg', 'NC', 'helix', 'disulfide', 'mpnn']
     colors = ['b', 'g', 'r', 'c', 'm', 'y', 'k']
 
     for index, metric in enumerate(metrics_to_plot):

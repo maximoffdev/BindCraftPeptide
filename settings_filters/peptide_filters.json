@@ -416,16 +416,16 @@
         "higher": true
     },
     "Average_Interface_Hydrophobicity": {
-        "threshold": null,
-        "higher": true
+        "threshold": 0.5,
+        "higher": false
     },
     "1_Interface_Hydrophobicity": {
-        "threshold": null,
-        "higher": true
+        "threshold": 0.5,
+        "higher": false
     },
     "2_Interface_Hydrophobicity": {
-        "threshold": null,
-        "higher": true
+        "threshold": 0.5,
+        "higher": false
     },
     "3_Interface_Hydrophobicity": {
         "threshold": null,
@@ -440,15 +440,15 @@
         "higher": true
     },
     "Average_n_InterfaceResidues": {
-        "threshold": 4,
+        "threshold": 7,
         "higher": true
     },
     "1_n_InterfaceResidues": {
-        "threshold": 4,
+        "threshold": 7,
         "higher": true
     },
     "2_n_InterfaceResidues": {
-        "threshold": 4,
+        "threshold": 7,
         "higher": true
     },
     "3_n_InterfaceResidues": {
@@ -464,15 +464,15 @@
         "higher": true
     },
     "Average_n_InterfaceHbonds": {
-        "threshold": 1,
+        "threshold": 5,
         "higher": true
     },
     "1_n_InterfaceHbonds": {
-        "threshold": 1,
+        "threshold": 5,
         "higher": true
     },
     "2_n_InterfaceHbonds": {
-        "threshold": 1,
+        "threshold": 5,
         "higher": true
     },
     "3_n_InterfaceHbonds": {
@@ -488,15 +488,15 @@
         "higher": true
     },
     "Average_InterfaceHbondsPercentage": {
-        "threshold": null,
+        "threshold": 30,
         "higher": true
     },
     "1_InterfaceHbondsPercentage": {
-        "threshold": null,
+        "threshold": 30,
         "higher": true
     },
     "2_InterfaceHbondsPercentage": {
-        "threshold": null,
+        "threshold": 30,
         "higher": true
     },
     "3_InterfaceHbondsPercentage": {
@@ -632,16 +632,16 @@
         "higher": false
     },
     "Average_Binder_Helix%": {
-        "threshold": null,
-        "higher": true
+        "threshold": 5,
+        "higher": false
     },
     "1_Binder_Helix%": {
-        "threshold": null,
-        "higher": true
+        "threshold": 5,
+        "higher": false
     },
     "2_Binder_Helix%": {
-        "threshold": null,
-        "higher": true
+        "threshold": 5,
+        "higher": false
     },
     "3_Binder_Helix%": {
         "threshold": null,
@@ -680,15 +680,15 @@
         "higher": true
     },
     "Average_Binder_Loop%": {
-        "threshold": 90,
+        "threshold": null,
         "higher": false
     },
     "1_Binder_Loop%": {
-        "threshold": 90,
+        "threshold": null,
         "higher": false
     },
     "2_Binder_Loop%": {
-        "threshold": 90,
+        "threshold": null,
         "higher": false
     },
     "3_Binder_Loop%": {

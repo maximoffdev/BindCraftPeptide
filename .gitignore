@@ -1,0 +1,31 @@
+# Ignore example output and generated files
+example/
+
+# AlphaFold model parameters (large files)
+params/
+params_model*.npz
+**/params_model*.npz
+
+# Python bytecode cache
+__pycache__/
+*/__pycache__/
+functions/__pycache__/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Python virtualenv
+venv/
+env/
+.venv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Logs
+.log
+
+# macOS
+.DS_Store
