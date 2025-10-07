@@ -2,6 +2,7 @@
 ###################### BindCraft Run
 ####################################
 ### Import dependencies
+import sys
 from functions import *
 
 # Check if JAX-capable GPU is available, otherwise exit
@@ -17,18 +18,24 @@ parser.add_argument('--filters', '-f', type=str, default='./settings_filters/def
                     help='Path to the filters.json file used to filter design. If not provided, default will be used.')
 parser.add_argument('--advanced', '-a', type=str, default='./settings_advanced/default_4stage_multimer.json',
                     help='Path to the advanced.json file with additional design settings. If not provided, default will be used.')
+parser.add_argument('--prefilters', '-p', type=str, default=None,
+                    help='Path to the prefilters.json file used to pre-filter trajectories before MPNN redesign. If not provided, default will be used.')
 
 args = parser.parse_args()
 
 # perform checks of input setting files
-settings_path, filters_path, advanced_path = perform_input_check(args)
+settings_path, filters_path, advanced_path, prefilters_path = perform_input_check(args)
 
 ### load settings from JSON
-target_settings, advanced_settings, filters = load_json_settings(settings_path, filters_path, advanced_path)
+target_settings, advanced_settings, filters, prefilters = load_json_settings(settings_path, filters_path, advanced_path, prefilters_path)
 
 settings_file = os.path.basename(settings_path).split('.')[0]
 filters_file = os.path.basename(filters_path).split('.')[0]
 advanced_file = os.path.basename(advanced_path).split('.')[0]
+if prefilters_path is not None:
+    prefilters_file = os.path.basename(prefilters_path).split('.')[0]
+else:
+    prefilters_file = None
 
 ### load AF2 model settings
 design_models, prediction_models, multimer_validation = load_af2_models(advanced_settings["use_multimer_design"])
@@ -63,6 +70,13 @@ pr.init(f'-ignore_unrecognized_res -ignore_zero_occupancy -mute all -holes:dalph
 print(f"Running binder design for target {settings_file}")
 print(f"Design settings used: {advanced_file}")
 print(f"Filtering designs based on {filters_file}")
+if prefilters_file is not None and advanced_settings.get("pre_filter_trajectory", False):
+    print(f"Pre-filtering trajectories based on {prefilters_file}")
+elif prefilters_file is None and advanced_settings.get("pre_filter_trajectory", False):
+    print("-------------------------------------------------------------------------------------")
+    print("Warning: pre_filter_trajectory is enabled but no prefilters file provided, exiting...")
+    print("-------------------------------------------------------------------------------------")
+    sys.exit(1)
 
 ####################################
 # initialise counters
@@ -169,6 +183,61 @@ while True:
             if not trajectory_interface_residues:
                 print("No interface residues found for "+str(design_name)+", skipping MPNN optimization")
                 continue
+
+            if advanced_settings.get("direct_trajectory_filtering", False) or advanced_settings.get("pre_filter_trajectory", False) or advanced_settings["enable_mpnn"] == False:
+                # Filter the original trajectory sequence directly without MPNN redesign
+                if advanced_settings.get("pre_filter_trajectory", False):
+                    if prefilters_file is not None:
+                        print("Pre-filtering trajectory based on "+str(prefilters_file)+"...")
+                        trajectory_filters = prefilters
+                        trajectory_filters_file = prefilters_file
+                    else:
+                        print("No pre-filters file provided, skipping pre-filtering step...")
+                        trajectory_filters = None
+                        trajectory_filters_file = None
+                elif advanced_settings.get("direct_trajectory_filtering", False) or advanced_settings["enable_mpnn"] == False:
+                    trajectory_filters = filters
+                    trajectory_filters_file = filters_file
+                    print("Direct trajectory filtering enabled...")
+                else:
+                    trajectory_filters = None
+                    trajectory_filters_file = None
+
+                if trajectory_filters is not None:
+                    complex_prediction_model, binder_prediction_model = init_prediction_models(
+                        trajectory_pdb=trajectory_pdb,
+                        length=length,
+                        mk_afdesign_model=mk_afdesign_model,
+                        multimer_validation=multimer_validation,
+                        target_settings=target_settings,
+                        advanced_settings=advanced_settings
+                    )
+
+                    filter_conditions, AF2_design_csv, failure_csv, final_csv = filter_design(
+                        sequence=trajectory_sequence,
+                        basis_design_name=design_name,
+                        design_paths=design_paths,
+                        trajectory_pdb=trajectory_pdb,
+                        length=length,
+                        helicity_value=helicity_value,
+                        seed=seed,
+                        prediction_models=prediction_models,
+                        binder_chain=binder_chain,
+                        filters=trajectory_filters,
+                        design_labels=design_labels,
+                        target_settings=target_settings,
+                        advanced_settings=advanced_settings,
+                        advanced_file=advanced_file,
+                        settings_file=settings_file,
+                        filters_file=trajectory_filters_file,
+                        stats_csv=AF2_design_csv,
+                        failure_csv=failure_csv,
+                        final_csv=final_csv,
+                        complex_prediction_model=complex_prediction_model,
+                        binder_prediction_model=binder_prediction_model,
+                        is_mpnn_model=False
+                        )                   
+
             
             # === MPNN SEQUENCE OPTIMIZATION SECTION ===
             # If MPNN is enabled, use ProteinMPNN to generate alternative sequences for the designed backbone
@@ -301,45 +370,6 @@ while True:
                 design_time = time.time() - design_start_time
                 design_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(design_time // 3600), int((design_time % 3600) // 60), int(design_time % 60))}"
                 print("Design and validation of trajectory "+design_name+" took: "+design_time_text)
-
-            else:
-                print("MPNN sequence optimization disabled, filtering trajectory directly.")
-                print("")
-
-                complex_prediction_model, binder_prediction_model = init_prediction_models(
-                    trajectory_pdb=trajectory_pdb,
-                    length=length,
-                    mk_afdesign_model=mk_afdesign_model,
-                    multimer_validation=multimer_validation,
-                    target_settings=target_settings,
-                    advanced_settings=advanced_settings
-                )
-
-                filter_conditions, AF2_design_csv, failure_csv, final_csv = filter_design(
-                    sequence=trajectory_sequence,
-                    basis_design_name=design_name,
-                    design_paths=design_paths,
-                    trajectory_pdb=trajectory_pdb,
-                    length=length,
-                    helicity_value=helicity_value,
-                    seed=seed,
-                    prediction_models=prediction_models,
-                    binder_chain=binder_chain,
-                    filters=filters,
-                    design_labels=design_labels,
-                    target_settings=target_settings,
-                    advanced_settings=advanced_settings,
-                    advanced_file=advanced_file,
-                    settings_file=settings_file,
-                    filters_file=filters_file,
-                    stats_csv=AF2_design_csv,
-                    failure_csv=failure_csv,
-                    final_csv=final_csv,
-                    complex_prediction_model=complex_prediction_model,
-                    binder_prediction_model=binder_prediction_model,
-                    is_mpnn_model=False
-                    )                   
-
 
             # === ACCEPTANCE RATE MONITORING ===
             # Check if the design process is too inefficient and should be stopped

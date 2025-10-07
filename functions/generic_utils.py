@@ -230,7 +230,7 @@ def perform_input_check(args):
     if not args.advanced:
         args.advanced = os.path.join(binder_script_path, 'settings_advanced', 'default_4stage_multimer.json')
 
-    return args.settings, args.filters, args.advanced
+    return args.settings, args.filters, args.advanced, args.prefilters
 
 # check specific advanced settings
 def perform_advanced_settings_check(advanced_settings, bindcraft_folder):
@@ -337,7 +337,7 @@ def _copy_to_exec_tmp(src_path: str, basename: str) -> str:
         return ""
 
 # Load settings from JSONs
-def load_json_settings(settings_json, filters_json, advanced_json):
+def load_json_settings(settings_json, filters_json, advanced_json, prefilters_json=None):
     # load settings from json files
     with open(settings_json, 'r') as file:
         target_settings = json.load(file)
@@ -347,8 +347,14 @@ def load_json_settings(settings_json, filters_json, advanced_json):
 
     with open(filters_json, 'r') as file:
         filters = json.load(file)
+    
+    if prefilters_json is not None:
+        with open(prefilters_json, 'r') as file:
+            prefilters = json.load(file)
+    else:
+        prefilters = None
 
-    return target_settings, advanced_settings, filters
+    return target_settings, advanced_settings, filters, prefilters
 
 # AF2 model settings, make sure non-overlapping models with template option are being used for design and re-prediction
 def load_af2_models(af_multimer_setting):

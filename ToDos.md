@@ -1,7 +1,7 @@
 Adjustable plddt and iptm filters during AF2 design protocol --> done
 
 
-AF2 validation and filters outside MPNN loop
+AF2 validation and filters outside MPNN loop --> done
 
 
 Disulfide peptide generation
