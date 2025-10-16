@@ -127,6 +127,39 @@ def calculate_clash_score(pdb_file, threshold=2.4, only_ca=False):
 
     return len(valid_pairs)
 
+def get_chain_length(pdb_file, chain_id):
+    """
+    Get the number of residues in a specific chain of a PDB file.
+    
+    Args:
+        pdb_file (str): Path to the PDB file
+        chain_id (str): Chain identifier (e.g., 'A', 'B')
+    
+    Returns:
+        int: Number of standard amino acid residues in the chain
+    
+    Raises:
+        ValueError: If the chain is not found in the PDB file
+    """
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure('protein', pdb_file)
+    
+    # Get the first model
+    model = structure[0]
+    
+    # Check if chain exists
+    if chain_id not in model:
+        available_chains = [chain.id for chain in model]
+        raise ValueError(f"Chain '{chain_id}' not found in PDB file. Available chains: {available_chains}")
+    
+    # Get the specified chain
+    chain = model[chain_id]
+    
+    # Count standard amino acid residues
+    residue_count = sum(1 for residue in chain if is_aa(residue, standard=True))
+    
+    return residue_count
+
 three_to_one_map = {
     'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
     'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',

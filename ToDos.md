@@ -5,15 +5,25 @@ AF2 validation and filters outside MPNN loop --> done
 
 
 Disulfide peptide generation
-    - terminal cystein sequence init
-    - disulfide loss
-    - pyrosetta disulfide closure and relax
+    - terminal cystein sequence init    --> done
+    - disulfide loss    --> done
+    - pyrosetta disulfide closure and relax --> done
+    - mpnn fixation of C residues for disulfide cyclization --> done
 
 
-Optimize ProteinMPNN usage (biases, ...)
+Partial Hallucination for AF2 design protocol (to combine with RFDiffusion)
+
+
+Filtering based on RMSD to designed structure
+
+
+# Optimize ProteinMPNN usage (biases, ...)
 
 
 Add pre-filtering step directly after AF2 design protocol (filtering out unwanted secondary structures etc.)
+
+
+Select MPNN designs after generating and evaluating all of them.
 
 
 Amino acid distribution losses during AF2 design protocol
@@ -26,9 +36,6 @@ Filters
     - backbone filter
     - adjusted scores filters pLDDT, ipTM 
     - H-bonds, contact points filters
-
-
-Partial Hallucination for AF2 design protocol
 
 
 Analysis tools:

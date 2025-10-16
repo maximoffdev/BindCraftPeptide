@@ -110,7 +110,13 @@ while True:
     seed = int(np.random.randint(0, high=999999, size=1, dtype=int)[0])
 
     # sample binder design length randomly from defined distribution
-    samples = np.arange(min(target_settings["lengths"]), max(target_settings["lengths"]) + 1)
+    if target_settings.get("protocol", "binder") == "partial":
+        # ensure length is minimum length of already existing binder chain
+        min_length = get_chain_length(target_settings["starting_pdb"], "B")  # assuming binder is chain B
+    else:
+        min_length = min(target_settings["lengths"])
+    max_length = max(target_settings["lengths"]) if max(target_settings["lengths"]) > min_length else min_length
+    samples = np.arange(min_length, max_length + 1)
     length = np.random.choice(samples)
 
     # load desired helicity value to sample different secondary structure contents
@@ -125,8 +131,8 @@ while True:
         print("Starting trajectory: "+design_name)
 
         ### Begin binder hallucination
-        trajectory = binder_hallucination(design_name, target_settings["starting_pdb"], target_settings["chains"],
-                                            target_settings["target_hotspot_residues"], length, seed, helicity_value,
+        trajectory = binder_hallucination(design_name, target_settings["starting_pdb"], target_settings.get("protocol", "binder"), target_settings["chains"],
+                                            target_settings["target_hotspot_residues"], target_settings.get("pos", None), length, seed, helicity_value,
                                             design_models, advanced_settings, design_paths, failure_csv)
         trajectory_metrics = copy_dict(trajectory._tmp["best"]["aux"]["log"]) # contains plddt, ptm, i_ptm, pae, i_pae
         trajectory_pdb = os.path.join(design_paths["Trajectory"], design_name + ".pdb")
@@ -202,6 +208,7 @@ while True:
                 else:
                     trajectory_filters = None
                     trajectory_filters_file = None
+                    print("No trajectory filtering enabled...")
 
                 if trajectory_filters is not None:
                     complex_prediction_model, binder_prediction_model = init_prediction_models(

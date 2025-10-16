@@ -14,20 +14,20 @@ from colabdesign.mpnn import mk_mpnn_model
 from colabdesign.af.alphafold.common import residue_constants
 from colabdesign.af.loss import get_ptm, mask_loss, get_dgram_bins, _get_con_loss
 from colabdesign.shared.utils import copy_dict
-from .biopython_utils import hotspot_residues, calculate_clash_score, calc_ss_percentage, calculate_percentages
-from .pyrosetta_utils import pr_relax, align_pdbs
+from .biopython_utils import hotspot_residues, calculate_clash_score, calc_ss_percentage, calculate_percentages, get_chain_length
+from .pyrosetta_utils import pr_relax, align_pdbs, pr_staple_disulfides
 from . import pyrosetta_utils as pr_utils
 from .generic_utils import update_failures
 
 # hallucinate a binder
-def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residues, length, seed, helicity_value, design_models, advanced_settings, design_paths, failure_csv):
+def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hotspot_residues, pos, length, seed, helicity_value, design_models, advanced_settings, design_paths, failure_csv):
     model_pdb_path = os.path.join(design_paths["Trajectory"], design_name+".pdb")
 
     # clear GPU memory for new trajectory
     clear_mem()
 
     # initialise binder hallucination model
-    af_model = mk_afdesign_model(protocol="binder", debug=False, data_dir=advanced_settings["af_params_dir"], 
+    af_model = mk_afdesign_model(protocol=protocol, debug=False, data_dir=advanced_settings["af_params_dir"], 
                                 use_multimer=advanced_settings["use_multimer_design"], num_recycles=advanced_settings["num_recycles_design"],
                                 best_metric='loss')
 
@@ -35,8 +35,37 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
     if target_hotspot_residues == "":
         target_hotspot_residues = None
 
-    af_model.prep_inputs(pdb_filename=starting_pdb, chain=chain, binder_len=length, hotspot=target_hotspot_residues, seed=seed, rm_aa=advanced_settings["omit_AAs"],
-                        rm_target_seq=advanced_settings["rm_template_seq_design"], rm_target_sc=advanced_settings["rm_template_sc_design"])
+    if protocol == "binder":
+        af_model.prep_inputs(pdb_filename=starting_pdb, 
+                             chain=chain, 
+                             binder_len=length, 
+                             hotspot=target_hotspot_residues, 
+                             seed=seed, 
+                             rm_aa=advanced_settings["omit_AAs"],
+                            rm_target_seq=advanced_settings["rm_template_seq_design"], 
+                            rm_target_sc=advanced_settings["rm_template_sc_design"])
+        
+    elif protocol == "partial":
+        if pos is None:
+            # set pos to positions of the target chain
+            pos = f"1-{get_chain_length(starting_pdb, chain)}"
+        total_length = length + get_chain_length(starting_pdb, chain)
+
+        print(f"Partial hallucination, constraining positions: {pos}, total length: {total_length}")
+
+        af_model.prep_inputs(pdb_filename=starting_pdb,
+                     chain="A,B", # assuming target is chain A and binder is chain B
+                     pos=pos,  # define positions to contrain
+                     length=total_length,   # total length if different from input pdb
+                     hotspot=target_hotspot_residues, 
+                     seed=seed,
+                     rm_aa=advanced_settings["omit_AAs"],
+                     rm_target_seq=advanced_settings["rm_template_seq_design"],
+                     rm_target_sc=advanced_settings["rm_template_sc_design"])  
+         # Manually set attributes for disulfide loss compatibility
+        af_model._target_len = get_chain_length(starting_pdb, chain)
+        af_model._binder_len = length        
+
 
     ### Update weights based on specified settings
     af_model.opt["weights"].update({"pae":advanced_settings["weights_pae_intra"],
@@ -66,6 +95,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
 
     # optionally add disulfide promotion loss and seed cysteines
     if advanced_settings.get("use_disulfide_loss", False):
+        # ToDo: Add option to generate terminal disulfide pattern
         # determine disulfide pairs (binder-local 0-based indices)
         ds_pairs = advanced_settings.get("disulfide_pairs")
         if not ds_pairs or len(ds_pairs) == 0:
@@ -204,11 +234,17 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
 
                 if onehot_plddt > advanced_settings.get("onehot_plddt", 0.65):
                     # perform greedy mutation optimisation
+                    # ToDo: solve bias issue to enable greedy opt for disulfide generation (maybe reinitialise model with best sequence to avoid bias issues)
                     print("One-hot trajectory pLDDT good, continuing: "+str(onehot_plddt))
-                    if advanced_settings["greedy_iterations"] > 0:
+                    if advanced_settings["greedy_iterations"] > 0:# and advanced_settings.get("use_disulfide_loss", False) == False:
                         print("Stage 4: PSSM Semigreedy Optimisation")
+                        current_seq = af_model.get_seq()[0]
+                        af_model.set_seq(seq=current_seq)
+                        
                         af_model.design_pssm_semigreedy(soft_iters=0, hard_iters=advanced_settings["greedy_iterations"], tries=greedy_tries, models=design_models, 
                                                         num_models=1, sample_models=advanced_settings["sample_models"], ramp_models=False, save_best=True)
+                    elif advanced_settings.get("use_disulfide_loss", False):
+                        print("Disulfide loss active, skipping semigreedy optimisation")
 
                 else:
                     update_failures(failure_csv, 'Trajectory_one-hot_pLDDT')
@@ -357,19 +393,25 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
         complex_pdb = os.path.join(design_paths[design_path_key], f"{mpnn_design_name}_model{model_num+1}.pdb")
         if pass_af2_filters:
             mpnn_relaxed = os.path.join(design_paths[design_path_key + "/Relaxed"], f"{mpnn_design_name}_model{model_num+1}.pdb")
-            pr_relax(complex_pdb, mpnn_relaxed)
+            pairs = (advanced_settings.get("disulfide_pairs_runtime")
+                     or advanced_settings.get("disulfide_pairs")) if advanced_settings.get("use_disulfide_loss", False) else None
+            pr_relax(complex_pdb, 
+                     mpnn_relaxed, 
+                     disulfide=advanced_settings.get("use_disulfide_loss", False), 
+                     binder_chain="B", 
+                     binder_local_pairs=pairs)
             # optional: staple disulfides in the binder chain after relaxation
-            if advanced_settings.get("use_disulfide_loss", False):
-                binder_chain = advanced_settings.get("binder_chain", "B")
-                pairs = advanced_settings.get("disulfide_pairs_runtime") or advanced_settings.get("disulfide_pairs")
-                if pairs:
-                    stapled_out = os.path.join(design_paths[design_path_key + "/Relaxed"], f"{mpnn_design_name}_model{model_num+1}_stapled.pdb")
-                    try:
-                        _staple = getattr(pr_utils, "pr_staple_disulfides", None)
-                        if _staple:
-                            _staple(mpnn_relaxed, stapled_out, binder_chain, pairs)
-                    except Exception:
-                        pass
+            # if advanced_settings.get("use_disulfide_loss", False):
+            #     binder_chain = advanced_settings.get("binder_chain", "B")
+            #     pairs = advanced_settings.get("disulfide_pairs_runtime") or advanced_settings.get("disulfide_pairs")
+            #     if pairs:
+            #         stapled_out = os.path.join(design_paths[design_path_key + "/Relaxed"], f"{mpnn_design_name}_model{model_num+1}_stapled.pdb")
+            #         try:
+            #             _staple = getattr(pr_utils, "pr_staple_disulfides", None)
+            #             if _staple:
+            #                 _staple(mpnn_relaxed, stapled_out, binder_chain, pairs)
+            #         except Exception:
+            #             pass
         else:
             if os.path.exists(complex_pdb):
                 os.remove(complex_pdb)
@@ -402,12 +444,15 @@ def predict_binder_alone(prediction_model, binder_sequence, mpnn_design_name, le
                 pairs = advanced_settings.get("disulfide_pairs_runtime") or advanced_settings.get("disulfide_pairs")
                 if pairs:
                     stapled_out = os.path.join(design_paths[design_path_key + "/Binder"], f"{mpnn_design_name}_model{model_num+1}_stapled.pdb")
-                    try:
-                        _staple = getattr(pr_utils, "pr_staple_disulfides", None)
-                        if _staple:
-                            _staple(binder_alone_pdb, stapled_out, binder_chain, pairs)
-                    except Exception:
-                        pass
+                    pr_staple_disulfides(binder_alone_pdb, stapled_out, binder_chain, pairs)
+                    print(f"Stapled disulfides on binder-alone model {model_num+1}")
+                    # try:
+                    #     _staple = getattr(pr_utils, "pr_staple_disulfides", None)
+                    #     if _staple:
+                    #         _staple(binder_alone_pdb, stapled_out, binder_chain, pairs)
+                    #         print(f"Stapled disulfides on binder-alone model {model_num+1}")
+                    # except Exception:
+                    #     pass
 
             # extract the statistics for the model
             stats = {
@@ -430,12 +475,28 @@ def mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residue
     # check whether keep the interface generated by the trajectory or whether to redesign with MPNN
     design_chains = 'A,' + binder_chain
 
+    pairs = (advanced_settings.get("disulfide_pairs_runtime")
+                     or advanced_settings.get("disulfide_pairs")) if advanced_settings.get("use_disulfide_loss", False) else None
+        
     if advanced_settings["mpnn_fix_interface"]:
         fixed_positions = 'A,' + trajectory_interface_residues
+
+        if pairs is not None:
+            # also fix the disulfide positions
+            for (i, j) in pairs:
+                fixed_positions = fixed_positions + ',' + binder_chain + str(i+1) + ',' + binder_chain + str(j+1)  # MPNN uses 1-based indexing
+                print(f"Fixing disulfide pair: ({i+1}, {j+1})")
+
         fixed_positions = fixed_positions.rstrip(",")
         print("Fixing interface residues: "+trajectory_interface_residues)
     else:
         fixed_positions = 'A'
+        if pairs is not None:
+            # also fix the disulfide positions
+            for (i, j) in pairs:
+                fixed_positions = fixed_positions + ',' + binder_chain + str(i+1) + ',' + binder_chain + str(j+1)  # MPNN uses 1-based indexing
+                print(f"Fixing disulfide pair: ({i+1}, {j+1})")
+            fixed_positions = fixed_positions.rstrip(",")
 
     # prepare inputs for MPNN
     mpnn_model.prep_inputs(pdb_filename=trajectory_pdb, chain=design_chains, fix_pos=fixed_positions, rm_aa=advanced_settings["omit_AAs"])
