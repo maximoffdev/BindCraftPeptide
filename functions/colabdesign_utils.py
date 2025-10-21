@@ -2,7 +2,7 @@
 ############## ColabDesign functions
 ####################################
 ### Import dependencies
-import os, re, shutil, math, pickle, random
+import os, re, shutil, math, pickle, random, pprint
 import matplotlib.pyplot as plt
 import numpy as np
 import jax
@@ -18,6 +18,9 @@ from .biopython_utils import hotspot_residues, calculate_clash_score, calc_ss_pe
 from .pyrosetta_utils import pr_relax, align_pdbs, pr_staple_disulfides
 from . import pyrosetta_utils as pr_utils
 from .generic_utils import update_failures
+from Bio.PDB import PDBParser
+from colabdesign.af.prep import prep_pdb, prep_pos, make_fixed_size, get_multi_id
+from colabdesign.af.model import mk_af_model
 
 # hallucinate a binder
 def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hotspot_residues, pos, length, seed, helicity_value, design_models, advanced_settings, design_paths, failure_csv):
@@ -27,7 +30,7 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
     clear_mem()
 
     # initialise binder hallucination model
-    af_model = mk_afdesign_model(protocol=protocol, debug=False, data_dir=advanced_settings["af_params_dir"], 
+    af_model = mk_af_model_advanced(protocol=protocol, debug=False, data_dir=advanced_settings["af_params_dir"], 
                                 use_multimer=advanced_settings["use_multimer_design"], num_recycles=advanced_settings["num_recycles_design"],
                                 best_metric='loss')
 
@@ -45,26 +48,17 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
                             rm_target_seq=advanced_settings["rm_template_seq_design"], 
                             rm_target_sc=advanced_settings["rm_template_sc_design"])
         
-    elif protocol == "partial":
-        if pos is None:
-            # set pos to positions of the target chain
-            pos = f"1-{get_chain_length(starting_pdb, chain)}"
-        total_length = length + get_chain_length(starting_pdb, chain)
-
-        print(f"Partial hallucination, constraining positions: {pos}, total length: {total_length}")
-
-        af_model.prep_inputs(pdb_filename=starting_pdb,
-                     chain="A,B", # assuming target is chain A and binder is chain B
-                     pos=pos,  # define positions to contrain
-                     length=total_length,   # total length if different from input pdb
-                     hotspot=target_hotspot_residues, 
-                     seed=seed,
-                     rm_aa=advanced_settings["omit_AAs"],
-                     rm_target_seq=advanced_settings["rm_template_seq_design"],
-                     rm_target_sc=advanced_settings["rm_template_sc_design"])  
-         # Manually set attributes for disulfide loss compatibility
-        af_model._target_len = get_chain_length(starting_pdb, chain)
-        af_model._binder_len = length        
+    elif protocol == "binder_advanced":
+        af_model.prep_inputs(
+            pdb_filename=starting_pdb,
+            target_chain="A",
+            binder_chain="B",
+            fixed_positions="1-3",
+            template_positions="5,6",
+            hotspot=target_hotspot_residues,
+            rm_target_sc=advanced_settings["rm_template_sc_design"],
+            rm_target_seq=advanced_settings["rm_template_seq_design"]
+        )      
 
 
     ### Update weights based on specified settings
@@ -94,7 +88,7 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
         add_termini_distance_loss(af_model, advanced_settings["weights_termini_loss"])
 
     # optionally add disulfide promotion loss and seed cysteines
-    if advanced_settings.get("use_disulfide_loss", False):
+    if advanced_settings.get("use_disulfide_loss", False): # and protocol == "binder":
         # ToDo: Add option to generate terminal disulfide pattern
         # determine disulfide pairs (binder-local 0-based indices)
         ds_pairs = advanced_settings.get("disulfide_pairs")
@@ -177,7 +171,7 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
     elif advanced_settings["design_algorithm"] == '4stage':
         # initial logits to prescreen trajectory
         print("Stage 1: Test Logits")
-        af_model.design_logits(iters=50, e_soft=0.9, models=design_models, num_models=1, sample_models=advanced_settings["sample_models"], save_best=True)
+        af_model.design_logits(iters=5, e_soft=0.9, models=design_models, num_models=1, sample_models=advanced_settings["sample_models"], save_best=True)
 
         # determine pLDDT of best iteration according to lowest 'loss' value
         initial_plddt = get_best_plddt(af_model, length)
@@ -328,6 +322,7 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
         with open(os.path.join(design_paths["Trajectory/Pickle"], design_name+".pickle"), 'wb') as handle:
             pickle.dump(af_model.aux['all'], handle, protocol=pickle.HIGHEST_PROTOCOL)
 
+
     return af_model
 
 # run prediction for binder with masked template target
@@ -336,6 +331,15 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
 
     # clean sequence
     binder_sequence = re.sub("[^A-Z]", "", binder_sequence.upper())
+    
+    # # Clear any existing bias that might have incompatible dimensions
+    # # This is critical when the binder sequence length differs from the design trajectory length
+    # if "bias" in prediction_model._inputs:
+    #     del prediction_model._inputs["bias"]
+    
+    # Explicitly set the sequence to ensure proper model reinitialization
+    # This ensures the model's internal state (including sequence length) is correctly updated
+    prediction_model.set_seq(binder_sequence)
 
     # reset filtering conditionals
     pass_af2_filters = True
@@ -346,8 +350,8 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
         # check to make sure prediction does not exist already
         complex_pdb = os.path.join(design_paths[design_path_key], f"{mpnn_design_name}_model{model_num+1}.pdb")
         if not os.path.exists(complex_pdb):
-            # predict model
-            prediction_model.predict(seq=binder_sequence, models=[model_num], num_recycles=advanced_settings["num_recycles_validation"], verbose=False)
+            # predict model (no need to pass seq= since we already called set_seq above)
+            prediction_model.predict(models=[model_num], num_recycles=advanced_settings["num_recycles_validation"], verbose=False)
             prediction_model.save_pdb(complex_pdb)
             prediction_metrics = copy_dict(prediction_model.aux["log"]) # contains plddt, ptm, i_ptm, pae, i_pae
 
@@ -424,6 +428,11 @@ def predict_binder_alone(prediction_model, binder_sequence, mpnn_design_name, le
 
     # prepare sequence for prediction
     binder_sequence = re.sub("[^A-Z]", "", binder_sequence.upper())
+    
+    # # Clear any existing bias that might have incompatible dimensions
+    # if "bias" in prediction_model._inputs:
+    #     del prediction_model._inputs["bias"]
+    
     prediction_model.set_seq(binder_sequence)
 
     # predict each model separately
@@ -683,3 +692,472 @@ def plot_trajectory(af_model, design_name, design_paths):
             
             # Close the figure
             plt.close()
+
+
+# Extended ColabDesign model with binder_advanced protocol
+class mk_af_model_advanced(mk_af_model):
+    """
+    Extended AlphaFold model with custom binder_advanced protocol.
+    
+    This subclass adds support for position-specific redesign control,
+    allowing you to:
+    - Fix certain positions (keep original sequence and structure)
+    - Template-fix positions (keep structure, allow sequence redesign)
+    - Redesign positions (full freedom)
+    
+    Usage:
+        from functions.colabdesign_utils import mk_af_model_advanced
+        
+        model = mk_af_model_advanced(protocol="binder_advanced", ...)
+        model.prep_inputs(
+            pdb_filename="complex.pdb",
+            target_chain="A",
+            binder_chain="B",
+            fixed_positions="1-3",
+            template_positions="10-15",
+            hotspot="50,55-60"
+        )
+    """
+    
+    def __init__(self,
+                 protocol="fixbb",
+                 use_multimer=False,
+                 use_templates=False,
+                 debug=False,
+                 data_dir=".",
+                 **kwargs):
+        
+        # Validate protocol - add our new one to allowed protocols
+        if protocol not in ["fixbb", "hallucination", "binder", "partial", "binder_advanced"]:
+            raise ValueError(f"protocol must be one of: fixbb, hallucination, binder, partial, binder_advanced")
+        
+        # Handle binder_advanced as a variant of binder
+        if protocol == "binder_advanced":
+            # Initialize as standard binder protocol
+            super().__init__(protocol="binder",
+                           use_multimer=use_multimer,
+                           use_templates=use_templates,
+                           debug=debug,
+                           data_dir=data_dir,
+                           **kwargs)
+            
+            # Override the protocol name
+            self.protocol = "binder_advanced"
+            
+            # Override prep_inputs to use our custom function
+            # Create a bound method that passes self as af_model
+            def _prep_binder_advanced_method(pdb_filename,
+                                             target_chain="A",
+                                             binder_chain="B",
+                                             fixed_positions=None,
+                                             template_positions=None,
+                                             redesign_positions=None,
+                                             hotspot=None,
+                                             rm_target_seq=False,
+                                             rm_target_sc=False,
+                                             ignore_missing=True,
+                                             **method_kwargs):
+                """Bound method wrapper for prep_binder_advanced"""
+                return prep_binder_advanced(
+                    af_model=self,
+                    pdb_filename=pdb_filename,
+                    target_chain=target_chain,
+                    binder_chain=binder_chain,
+                    fixed_positions=fixed_positions,
+                    template_positions=template_positions,
+                    redesign_positions=redesign_positions,
+                    hotspot=hotspot,
+                    rm_target_seq=rm_target_seq,
+                    rm_target_sc=rm_target_sc,
+                    ignore_missing=ignore_missing,
+                    **method_kwargs
+                )
+            
+            # Assign as instance method
+            self.prep_inputs = _prep_binder_advanced_method
+            
+            # Keep the same loss function as standard binder (already set by parent __init__)
+            # self._get_loss is already _loss_binder
+            
+        else:
+            # Standard protocols - just call parent __init__
+            super().__init__(protocol=protocol,
+                           use_multimer=use_multimer,
+                           use_templates=use_templates,
+                           debug=debug,
+                           data_dir=data_dir,
+                           **kwargs)
+            
+    def save_pdb_sanitized(self, filename, get_best=True, renum_pdb=True, aux=None):
+        """
+        Saves a PDB file with minimal ATOM records, stripping potential metadata.
+        """
+        if aux is None:
+            aux = self._tmp["best"]["aux"] if (get_best and "aux" in self._tmp["best"]) else self.aux
+        
+        # Use only the first model's output for a clean, single-model PDB
+        aux = jax.tree_map(lambda x: x[0], aux["all"])
+
+        p = {
+            "aatype": aux["aatype"],
+            "residue_index": aux["residue_index"],
+            "atom_positions": aux["atom_positions"],
+            "atom_mask": aux["atom_mask"],
+            "b_factors": 100 * aux["atom_mask"] * aux["plddt"][..., None]
+        }
+
+        # Standard atom names and residue names
+        restypes = "ACDEFGHIKLMNPQRSTVWYX"
+        res_3_to_1 = {
+            "ALA": "A", "CYS": "C", "ASP": "D", "GLU": "E", "PHE": "F", "GLY": "G", "HIS": "H",
+            "ILE": "I", "LYS": "K", "LEU": "L", "MET": "M", "ASN": "N", "PRO": "P", "GLN": "Q",
+            "ARG": "R", "SER": "S", "THR": "T", "VAL": "V", "TRP": "W", "TYR": "Y", "UNK": "X"
+        }
+        res_1_to_3 = {v: k for k, v in res_3_to_1.items()}
+        
+        atom_types = [
+            "N", "CA", "C", "CB", "O", "CG", "CG1", "CG2", "OG", "OG1", "SG", "CD",
+            "CD1", "CD2", "ND", "ND1", "ND2", "OD1", "OD2", "SD", "CE", "CE1", "CE2",
+            "CE3", "NE", "NE1", "NE2", "OE1", "OE2", "CH2", "NH1", "NH2", "OH",
+            "CZ", "CZ2", "CZ3", "NZ", "OXT"
+        ]
+        
+        pdb_lines = []
+        atom_idx = 1
+        
+        # Determine chain boundaries from _lengths
+        chain_breaks = np.cumsum(self._lengths)
+        
+        for i in range(p["aatype"].shape[0]):  # Iterate through residues
+            res_idx = p["residue_index"][i]
+            aa_type_idx = p["aatype"][i]
+            res_name = res_1_to_3.get(restypes[aa_type_idx], "UNK")
+            
+            # Determine chain ID
+            chain_idx = np.where(i < chain_breaks)[0][0]
+            chain_id = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[chain_idx]
+
+            for j in range(p["atom_positions"].shape[1]):  # Iterate through atoms
+                if p["atom_mask"][i, j] > 0:
+                    atom_name = atom_types[j]
+                    x, y, z = p["atom_positions"][i, j]
+                    b_factor = p["b_factors"][i, j]
+                    
+                    line = (
+                        f"ATOM  {atom_idx:5d} {atom_name:<4s} {res_name:<3s} {chain_id}{res_idx:4d}    "
+                        f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00{b_factor:6.2f}           {atom_name[0]:>1s}  "
+                    )
+                    pdb_lines.append(line)
+                    atom_idx += 1
+        
+        with open(filename, 'w') as f:
+            f.write("\n".join(pdb_lines))
+            f.write("\nEND\n")
+
+
+
+# Custom prep function for advanced binder redesign with selective control
+def prep_binder_advanced(af_model, pdb_filename, 
+                        target_chain="A", 
+                        binder_chain="B",
+                        binder_len=None,           # For hallucination: length of new binder to create
+                        fixed_positions=None,      # Positions to keep original sequence (1-based)
+                        template_positions=None,   # Positions to fix in space (1-based)
+                        redesign_positions=None,   # Positions to redesign (if None, redesign all except fixed)
+                        hotspot=None,
+                        rm_target_seq=False,
+                        rm_target_sc=False,
+                        ignore_missing=True,
+                        seed=None,
+                        **kwargs):
+    """
+    Advanced binder prep with fine-grained positional control.
+    
+    This function follows the same pattern as ColabDesign's _prep_binder method,
+    but adds fine-grained control over which positions to fix/redesign.
+    
+    Supports two modes:
+    1. **Redesign mode**: Redesign an existing binder with position control
+       - Triggered when binder_chain exists in PDB and binder_len=None
+    2. **Hallucination mode**: Create a new binder with position control
+       - Triggered when binder_len is specified
+    
+    Three levels of position control:
+    1. Binder redesign (like standard _prep_binder with redesign=True)
+    2. Selective sequence fixation (exclude certain positions from redesign)
+    3. Selective template fixation (fix certain positions in space)
+    
+    Args:
+        af_model: The AF model instance to prepare
+        pdb_filename: Path to PDB file containing target-binder complex
+        target_chain: Chain ID(s) of the target protein (comma-separated for multiple)
+        binder_chain: Chain ID of the binder to redesign (or create in hallucination mode)
+        binder_len: Length of binder to hallucinate (None for redesign mode)
+        fixed_positions: Binder positions to keep original sequence (e.g., "1,5-10,15")
+                        These positions will NOT be redesigned at all
+        template_positions: Binder positions to fix in space (e.g., "1-5,20-25")
+                           These positions keep their coordinates but can be redesigned
+        redesign_positions: Binder positions to redesign (e.g., "6-19,26-50")
+                           If None, redesigns all positions except fixed_positions
+        hotspot: Target hotspot residues (e.g., "10,15-20")
+        rm_target_seq: Remove target sequence from template
+        rm_target_sc: Remove target sidechain from template
+        ignore_missing: Skip positions with missing density
+        seed: Random seed for hallucination mode
+        **kwargs: Additional arguments passed to _prep_model
+        
+    Example usage:
+        # Redesign existing binder
+        prep_binder_advanced(
+            model, 
+            "complex.pdb",
+            target_chain="A",
+            binder_chain="B",  # Exists in PDB
+            fixed_positions="1-3",      # Keep CYS-CYS-PRO motif
+            template_positions="10-15",  # Fix alpha helix in space
+            hotspot="50,55-60"
+        )
+        
+        # Hallucinate new binder
+        prep_binder_advanced(
+            model,
+            "target.pdb",
+            target_chain="A", 
+            binder_chain="B",
+            binder_len=50,              # Create new 50-residue binder
+            fixed_positions="5,25",     # Fix these positions after creation
+            hotspot="50,55-60"
+        )
+    """
+    
+    # Parse the PDB structure first to check what's in it
+    chains_to_load = f"{target_chain},{binder_chain}" if binder_chain else target_chain
+    im = [True] * len(chains_to_load.split(","))
+    af_model._pdb = prep_pdb(pdb_filename, chain=chains_to_load, ignore_missing=im)
+    
+    # Check if binder exists in PDB
+    available_chains = set(af_model._pdb["idx"]["chain"])
+    has_binder_in_pdb = binder_chain in available_chains
+    
+    # Determine mode: redesign vs hallucination
+    if has_binder_in_pdb and binder_len is None:
+        # REDESIGN MODE: Existing binder in PDB
+        redesign = True
+        print(f"🔄 Redesign mode: Using existing binder from chain {binder_chain}")
+    elif binder_len is not None:
+        # HALLUCINATION MODE: Create new binder
+        redesign = False
+        print(f"✨ Hallucination mode: Creating new binder of length {binder_len}")
+        if has_binder_in_pdb:
+            print(f"   Note: Ignoring existing chain {binder_chain} in PDB")
+    else:
+        raise ValueError(
+            f"Must specify either binder_len (hallucination) or have binder_chain='{binder_chain}' in PDB (redesign)"
+        )
+    
+    # Update protocol-specific args
+    af_model._args.update({"redesign": redesign})
+    
+    # Calculate target and binder lengths
+    af_model._target_len = sum([(af_model._pdb["idx"]["chain"] == c).sum() 
+                                for c in target_chain.split(",")])
+    
+    if redesign:
+        # REDESIGN MODE: Get binder length from PDB
+        af_model._binder_len = sum([(af_model._pdb["idx"]["chain"] == c).sum() 
+                                    for c in binder_chain.split(",")])
+        res_idx = af_model._pdb["residue_index"]
+    else:
+        # HALLUCINATION MODE: Use specified length
+        af_model._binder_len = binder_len
+        res_idx = af_model._pdb["residue_index"]
+        # Add 50-residue gap + binder indices (following ColabDesign convention)
+        res_idx = np.append(res_idx, res_idx[-1] + np.arange(binder_len) + 50)
+    
+    # CRITICAL: _len must be FULL complex length for proper sequence initialization
+    af_model._lengths = [af_model._target_len, af_model._binder_len]
+    af_model._len = sum(af_model._lengths)
+    
+    print(f"Target length: {af_model._target_len}, Binder length: {af_model._binder_len}")
+    
+    # Gather hotspot info (following _prep_binder pattern)
+    if hotspot is not None:
+        af_model.opt["hotspot"] = prep_pos(hotspot, **af_model._pdb["idx"])["pos"]
+    
+    # Extract wild-type binder sequence and set weights based on mode
+    if redesign:
+        # REDESIGN MODE: Extract existing binder sequence
+        af_model._wt_aatype = af_model._pdb["batch"]["aatype"][af_model._target_len:]
+        af_model.opt["weights"].update({
+            "dgram_cce": 1.0,
+            "rmsd": 0.0,
+            "fape": 0.0,
+            "con": 0.0,
+            "i_con": 0.0,
+            "i_pae": 0.0
+        })
+    else:
+        # HALLUCINATION MODE: Expand batch to include binder
+        af_model._pdb["batch"] = make_fixed_size(af_model._pdb["batch"], num_res=sum(af_model._lengths))
+        af_model.opt["weights"].update({
+            "plddt": 0.1,
+            "con": 0.0,
+            "i_con": 1.0,
+            "i_pae": 0.0
+        })
+        
+        # Initialize binder sequence randomly if seed provided
+        if seed is not None:
+            af_model.opt["weights"]["soft"] = 0.0
+            af_model._binder_seq_init = seed
+    
+    # === Process position specifications for advanced control ===
+    # Convert position strings to arrays (0-based binder-local indices)
+    fixed_pos_array = np.array([], dtype=int)
+    template_pos_array = np.array([], dtype=int)
+    redesign_pos_array = np.arange(af_model._binder_len)  # Default: all positions
+    
+    # Helper function to parse positions with chain-aware handling
+    def parse_binder_positions(pos_string, binder_chain):
+        """
+        Parse position string and convert to binder-local 0-based indices.
+        Handles both chain-prefixed (e.g., "B116,B117") and simple (e.g., "1,2,3") formats.
+        """
+        if pos_string is None or pos_string == "":
+            return np.array([], dtype=int)
+        
+        # Check if positions already have chain prefix (e.g., "B116,B117")
+        if any(c.isalpha() for c in pos_string.split(',')[0].split('-')[0]):
+            # Chain-aware format: use prep_pos and filter to binder
+            pos_dict = prep_pos(pos_string, **af_model._pdb["idx"])
+            pos_global = pos_dict["pos"]
+            # Convert to binder-local (0-based)
+            pos_local = np.array([p - af_model._target_len 
+                                  for p in pos_global 
+                                  if p >= af_model._target_len], dtype=int)
+        else:
+            # Simple numeric format: treat as binder-local 1-based positions
+            # Parse ranges like "1-3,5,7-9" -> [1,2,3,5,7,8,9]
+            # Then convert to 0-based indices
+            # Add binder chain prefix for prep_pos
+            prefixed = ','.join([
+                f"{binder_chain}{item}" for item in pos_string.split(',')
+            ])
+            pos_dict = prep_pos(prefixed, **af_model._pdb["idx"])
+            pos_global = pos_dict["pos"]
+            # Convert to binder-local (0-based)
+            pos_local = np.array([p - af_model._target_len 
+                                  for p in pos_global 
+                                  if p >= af_model._target_len], dtype=int)
+        
+        return pos_local
+    
+    # Parse each position specification
+    if fixed_positions:
+        fixed_pos_array = parse_binder_positions(fixed_positions, binder_chain)
+        print(f"Fixed positions (binder-local 0-based): {fixed_pos_array}")
+    
+    if template_positions:
+        template_pos_array = parse_binder_positions(template_positions, binder_chain)
+        print(f"Template-fixed positions (binder-local 0-based): {template_pos_array}")
+    
+    if redesign_positions:
+        redesign_pos_array = parse_binder_positions(redesign_positions, binder_chain)
+    else:
+        # Redesign all except fixed positions
+        if len(fixed_pos_array) > 0:
+            redesign_pos_array = np.setdiff1d(np.arange(af_model._binder_len), fixed_pos_array)
+    
+    print(f"Redesign positions (binder-local): {redesign_pos_array}")
+    
+    # === Set up designable positions (CRITICAL for sequence optimization) ===
+    # Convert binder-local positions to global positions and set as designable
+    # This tells ColabDesign which residues to optimize during design
+    designable_global = np.array([af_model._target_len + pos for pos in redesign_pos_array], dtype=int)
+    
+    # Also add template-fixed positions (structure fixed, but sequence designable)
+    if len(template_pos_array) > 0:
+        template_global = np.array([af_model._target_len + pos for pos in template_pos_array], dtype=int)
+        designable_global = np.unique(np.concatenate([designable_global, template_global]))
+    
+    # Set the positions to design (this is what ColabDesign uses during optimization)
+    af_model.opt["pos"] = designable_global
+    print(f"Designable positions (global): {designable_global}")
+    
+    # Configure input features (following _prep_binder pattern)
+    af_model._inputs = af_model._prep_features(num_res=sum(af_model._lengths), num_seq=1)
+    af_model._inputs["residue_index"] = res_idx
+    af_model._inputs["batch"] = af_model._pdb["batch"]
+    af_model._inputs.update(get_multi_id(af_model._lengths))
+    
+    # === Configure template masking (following _prep_binder pattern with advanced control) ===
+    T = af_model._target_len
+    L = sum(af_model._lengths)
+    
+    # Initialize template removal masks
+    rm = {}
+    rm["rm_template"] = np.full(L, False)
+    rm["rm_template_seq"] = np.full(L, False)
+    rm["rm_template_sc"] = np.full(L, False)
+    
+    # Target masking (user-controlled, following _prep_binder pattern)
+    rm["rm_template"][:T] = False  # Keep target structure
+    rm["rm_template_seq"][:T] = rm_target_seq
+    rm["rm_template_sc"][:T] = rm_target_sc
+    
+    # Binder masking - Advanced position-specific control
+    # 1. Fixed positions: Keep BOTH sequence and structure from template
+    if len(fixed_pos_array) > 0:
+        for pos in fixed_pos_array:
+            global_pos = T + pos
+            rm["rm_template"][global_pos] = False      # Keep structure
+            rm["rm_template_seq"][global_pos] = False  # Keep sequence
+            rm["rm_template_sc"][global_pos] = False   # Keep sidechain
+    
+    # 2. Template-fixed positions: Keep structure, remove sequence
+    if len(template_pos_array) > 0:
+        for pos in template_pos_array:
+            global_pos = T + pos
+            rm["rm_template"][global_pos] = False      # Keep structure (coordinates)
+            rm["rm_template_seq"][global_pos] = True   # Remove sequence (allow redesign)
+            rm["rm_template_sc"][global_pos] = True    # Remove sidechain (allow redesign)
+    
+    # 3. Redesign positions: Remove everything (full freedom)
+    for pos in redesign_pos_array:
+        global_pos = T + pos
+        # Only apply if not already handled by fixed or template positions
+        if pos not in fixed_pos_array and pos not in template_pos_array:
+            rm["rm_template"][global_pos] = True       # Remove structure template
+            rm["rm_template_seq"][global_pos] = True   # Remove sequence
+            rm["rm_template_sc"][global_pos] = True    # Remove sidechain
+    
+    # Set template options (following _prep_binder pattern)
+    af_model.opt["template"] = {"rm_ic": False}
+    af_model._inputs.update(rm)
+    
+    # Prepare the model (following _prep_binder pattern - this is the final step)
+    af_model._prep_model(**kwargs)
+
+    bias = af_model._inputs.get("bias")
+    if bias is not None:
+        if bias.ndim == 2:
+            bias = bias[None, ...]
+        if bias.shape[1] == af_model._binder_len:
+            full_bias = np.zeros((bias.shape[0], af_model._len, bias.shape[-1]), dtype=bias.dtype)
+            full_bias[:, af_model._target_len:, :] = bias[:, :af_model._binder_len, :]
+            af_model._inputs["bias"] = full_bias
+    
+    # Store position information for later reference
+    af_model._custom_positions = {
+        "fixed": fixed_pos_array,
+        "template_fixed": template_pos_array,
+        "redesign": redesign_pos_array
+    }
+    
+    print("Advanced binder prep complete!")
+    print(f"  Num Fixed sequence positions: {len(fixed_pos_array)}")
+    print(f"  Num Template-fixed positions: {len(template_pos_array)}")
+    print(f"  Num Redesign positions: {len(redesign_pos_array)}")
+
+    return af_model
+

@@ -250,7 +250,7 @@ def pr_relax(pdb_file, relaxed_pdb_path, disulfide=False, binder_chain=None, bin
         fastrelax = FastRelax()
         fastrelax.set_scorefxn(scorefxn)
         fastrelax.set_movemap(mmf) # set MoveMap
-        fastrelax.max_iter(200) # default iterations is 2500
+        fastrelax.max_iter(2500) # default iterations is 2500
         fastrelax.min_type("lbfgs_armijo_nonmonotone")
         fastrelax.constrain_relax_to_start_coords(True)
         fastrelax.apply(pose)

@@ -110,14 +110,17 @@ while True:
     seed = int(np.random.randint(0, high=999999, size=1, dtype=int)[0])
 
     # sample binder design length randomly from defined distribution
-    if target_settings.get("protocol", "binder") == "partial":
+    if target_settings.get("protocol", "binder") == "binder_advanced":
         # ensure length is minimum length of already existing binder chain
-        min_length = get_chain_length(target_settings["starting_pdb"], "B")  # assuming binder is chain B
-    else:
+        length = get_chain_length(target_settings["starting_pdb"], "B")  # assuming binder is chain B
+    elif target_settings.get("protocol", "binder") == "binder":
         min_length = min(target_settings["lengths"])
-    max_length = max(target_settings["lengths"]) if max(target_settings["lengths"]) > min_length else min_length
-    samples = np.arange(min_length, max_length + 1)
-    length = np.random.choice(samples)
+        max_length = max(target_settings["lengths"]) if max(target_settings["lengths"]) > min_length else min_length
+        samples = np.arange(min_length, max_length + 1)
+        length = np.random.choice(samples)
+    else:
+        print(f"Invalid protocol specified in settings.json, {target_settings.get('protocol', 'None')}, exiting...")
+        sys.exit(1)
 
     # load desired helicity value to sample different secondary structure contents
     helicity_value = load_helicity(advanced_settings)
@@ -219,9 +222,17 @@ while True:
                         target_settings=target_settings,
                         advanced_settings=advanced_settings
                     )
+                    
+                    # Extract only the binder portion from the full complex sequence
+                    # trajectory_sequence contains target+binder, we need only the last 'length' residues
+                    if target_settings.get("protocol", "binder") == "binder_advanced":
+                        binder_sequence = trajectory_sequence[-length:]
+                        sequence = binder_sequence
+                    else:
+                        sequence = trajectory_sequence
 
                     filter_conditions, AF2_design_csv, failure_csv, final_csv = filter_design(
-                        sequence=trajectory_sequence,
+                        sequence=sequence,
                         basis_design_name=design_name,
                         design_paths=design_paths,
                         trajectory_pdb=trajectory_pdb,
