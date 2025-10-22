@@ -13,7 +13,9 @@ Disulfide peptide generation
 
 Partial Hallucination for AF2 design protocol (to combine with RFDiffusion)
     - protocol implementation   --> done
-    - disulfide fixation (simplification of specification for head to tail cycl)
+    - disulfide fixation (simplification of specification for head to tail cycl)    --> done
+    - test
+    - ignore missing implementation
 
 
 Filtering based on RMSD to designed structure ? (maybe already included)

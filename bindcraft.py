@@ -122,6 +122,31 @@ while True:
         print(f"Invalid protocol specified in settings.json, {target_settings.get('protocol', 'None')}, exiting...")
         sys.exit(1)
 
+    ds_pairs = []
+    # load desired disulfide pairs if provided
+    ds_pairs_pre = advanced_settings.get("disulfide_pairs")
+    if ds_pairs_pre and len(ds_pairs_pre) > 0:
+        # validate provided pairs
+        valid = True
+        seen = set()
+        for (i, j) in ds_pairs_pre:
+            if j == -1:
+                # allow -1 to indicate last residue
+                j = length - 1
+            if i == j or i < 0 or j < 0 or i >= length or j >= length:
+                valid = False
+                break
+            if abs(i - j) < advanced_settings.get("disulfide_min_sep", 5):
+                valid = False
+                break
+            if i in seen or j in seen:
+                valid = False
+                break
+            seen.add(i); seen.add(j)
+            ds_pairs.append((i, j))
+        if not valid:
+            ds_pairs = []
+
     # load desired helicity value to sample different secondary structure contents
     helicity_value = load_helicity(advanced_settings)
 
@@ -135,7 +160,7 @@ while True:
 
         ### Begin binder hallucination
         trajectory = binder_hallucination(design_name, target_settings["starting_pdb"], target_settings.get("protocol", "binder"), target_settings["chains"],
-                                            target_settings["target_hotspot_residues"], target_settings.get("pos", None), length, seed, helicity_value,
+                                            target_settings["target_hotspot_residues"], target_settings.get("pos", None), length, seed, ds_pairs, helicity_value,
                                             design_models, advanced_settings, design_paths, failure_csv)
         trajectory_metrics = copy_dict(trajectory._tmp["best"]["aux"]["log"]) # contains plddt, ptm, i_ptm, pae, i_pae
         trajectory_pdb = os.path.join(design_paths["Trajectory"], design_name + ".pdb")
