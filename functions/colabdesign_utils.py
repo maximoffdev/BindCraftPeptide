@@ -21,6 +21,7 @@ from .generic_utils import update_failures
 from Bio.PDB import PDBParser
 from colabdesign.af.prep import prep_pdb, prep_pos, make_fixed_size, get_multi_id
 from colabdesign.af.model import mk_af_model
+from colabdesign.af.alphafold.common import residue_constants
 
 # hallucinate a binder
 def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hotspot_residues, pos, length, seed, ds_pairs, helicity_value, design_models, advanced_settings, design_paths, failure_csv):
@@ -172,6 +173,28 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
     # add the helicity loss
     add_helix_loss(af_model, helicity_value)
 
+    ### Additional amino acid composition losses
+    if advanced_settings.get("use_polar_bias", False):
+        # Polar amino acid bias (S, T, N, Q, Y, C)
+        add_polar_bias_loss(af_model, 
+                           weight=advanced_settings.get("weights_polar_bias", 0.1),
+                           polar_preference=advanced_settings.get("polar_preference", 0.5))
+        print(f"Added polar bias loss: weight={advanced_settings.get('weights_polar_bias', 0.1)}, target={advanced_settings.get('polar_preference', 0.5)}")
+
+    if advanced_settings.get("use_charged_bias", False):
+        # Charged amino acid bias (D, E, K, R, H)
+        add_charged_bias_loss(af_model,
+                             weight=advanced_settings.get("weights_charged_bias", 0.1),
+                             charged_preference=advanced_settings.get("charged_preference", 0.3))
+        print(f"Added charged bias loss: weight={advanced_settings.get('weights_charged_bias', 0.1)}, target={advanced_settings.get('charged_preference', 0.3)}")
+
+    if advanced_settings.get("use_hydrophilic_bias", False):
+        # Combined hydrophilic bias (polar + charged)
+        add_hydrophilic_bias_loss(af_model,
+                                  weight=advanced_settings.get("weights_hydrophilic_bias", 0.1),
+                                  hydrophilic_preference=advanced_settings.get("hydrophilic_preference", 0.6))
+        print(f"Added hydrophilic bias loss: weight={advanced_settings.get('weights_hydrophilic_bias', 0.1)}, target={advanced_settings.get('hydrophilic_preference', 0.6)}")
+
     # calculate the number of mutations to do based on the length of the protein
     greedy_tries = math.ceil(length * (advanced_settings["greedy_percentage"] / 100))
 
@@ -201,7 +224,7 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
     elif advanced_settings["design_algorithm"] == '4stage':
         # initial logits to prescreen trajectory
         print("Stage 1: Test Logits")
-        af_model.design_logits(iters=5, e_soft=0.9, models=design_models, num_models=1, sample_models=advanced_settings["sample_models"], save_best=True)
+        af_model.design_logits(iters=75, e_soft=0.9, models=design_models, num_models=1, sample_models=advanced_settings["sample_models"], save_best=True)
 
         # determine pLDDT of best iteration according to lowest 'loss' value
         initial_plddt = get_best_plddt(af_model, length)
@@ -695,9 +718,165 @@ def add_disulfide_loss(self, weight=1.0, cutoff=7.0):
     self.opt["weights"]["disulfide"] = weight
     self.opt["disulfide_cutoff"] = cutoff
 
+# add polar amino acid bias loss
+def add_polar_bias_loss(self, weight=0.1, polar_preference=0.5):
+    '''
+    Add loss to bias amino acid composition toward polar residues.
+    
+    Polar residues: S, T, N, Q, Y, C (uncharged polar amino acids)
+    Uses AlphaFold's standard amino acid ordering: ARNDCQEGHILKMFPSTWYV
+    
+    Args:
+        weight: Loss weight (default 0.1)
+        polar_preference: Target fraction of polar residues (0.0-1.0, default 0.5 = 50%)
+    '''
+    
+    # AlphaFold ordering: A R N D C Q E G H I L K M F P S T W Y V
+    # Polar amino acids: C(4), N(2), Q(5), S(15), T(16), Y(18) but exclude C to avoid conflict with disulfide loss
+    polar_indices = jnp.array([2, 5, 15, 16, 18])
+    
+    def loss_fn(inputs, outputs):
+        if "seq" not in inputs:
+            return {"polar": jnp.array(0.0)}
+        
+        seq_input = inputs["seq"]
+        
+        # Use logits directly (the actual optimization variable)
+        if isinstance(seq_input, dict) and "logits" in seq_input:
+            seq_logits = seq_input["logits"]  # Shape: [batch, complex_len, 20] or [complex_len, 20]
+        else:
+            return {"polar": jnp.array(0.0)}
+        
+        # Remove batch dimension if present
+        if seq_logits.ndim == 3:
+            seq_logits = seq_logits[0]
+        
+        # Convert logits to probabilities
+        aa_probs = jax.nn.softmax(seq_logits, axis=-1)  # Shape: [complex_len, 20]
+        
+        # Extract binder portion (last _binder_len residues)
+        binder_probs = aa_probs[-self._binder_len:, :]  # Shape: [binder_len, 20]
+        
+        # Calculate polar residue probability at each position
+        polar_probs = binder_probs[:, polar_indices].sum(axis=-1)  # Shape: [binder_len]
+        mean_polar_fraction = polar_probs.mean()
+        
+        # Loss: squared deviation from target
+        deviation = mean_polar_fraction - polar_preference
+        loss = jnp.square(deviation)
+        
+        return {"polar": loss}
+    
+    self._callbacks["model"]["loss"].append(loss_fn)
+    self.opt["weights"]["polar"] = weight
+
+# add charged amino acid bias loss
+def add_charged_bias_loss(self, weight=0.1, charged_preference=0.3):
+    '''
+    Add loss to bias amino acid composition toward charged residues.
+    
+    Charged residues: D, E, K, R, H (acidic and basic amino acids)
+    Uses AlphaFold's standard amino acid ordering: ARNDCQEGHILKMFPSTWYV
+    
+    Args:
+        weight: Loss weight (default 0.1)
+        charged_preference: Target fraction of charged residues (0.0-1.0, default 0.3 = 30%)
+    '''
+    
+    # AlphaFold ordering: A R N D C Q E G H I L K M F P S T W Y V
+    # Charged amino acids: R(1), D(3), E(6), H(8), K(11)
+    charged_indices = jnp.array([1, 3, 6, 8, 11])
+
+    def loss_fn(inputs, outputs):
+        if "seq" not in inputs:
+            return {"charged": jnp.array(0.0)}
+        
+        seq_input = inputs["seq"]
+        
+        # Use logits directly (the actual optimization variable)
+        if isinstance(seq_input, dict) and "logits" in seq_input:
+            seq_logits = seq_input["logits"]
+        else:
+            return {"charged": jnp.array(0.0)}
+        
+        # Remove batch dimension if present
+        if seq_logits.ndim == 3:
+            seq_logits = seq_logits[0]
+        
+        # Convert logits to probabilities
+        aa_probs = jax.nn.softmax(seq_logits, axis=-1)
+        
+        # Extract binder portion
+        binder_probs = aa_probs[-self._binder_len:, :]
+        
+        # Calculate charged residue probability
+        charged_probs = binder_probs[:, charged_indices].sum(axis=-1)
+        mean_charged_fraction = charged_probs.mean()
+        
+        # Loss
+        deviation = mean_charged_fraction - charged_preference
+        loss = jnp.square(deviation)
+        
+        return {"charged": loss}
+    
+    self._callbacks["model"]["loss"].append(loss_fn)
+    self.opt["weights"]["charged"] = weight
+
+# add hydrophilic amino acid bias loss
+def add_hydrophilic_bias_loss(self, weight=0.1, hydrophilic_preference=0.6):
+    '''
+    Add loss to bias amino acid composition toward hydrophilic residues.
+    
+    Hydrophilic = Polar + Charged: C, N, Q, S, T, Y, D, E, H, K, R
+    Uses AlphaFold's standard amino acid ordering: ARNDCQEGHILKMFPSTWYV
+    
+    Args:
+        weight: Loss weight (default 0.1)
+        hydrophilic_preference: Target fraction of hydrophilic residues (0.0-1.0, default 0.6 = 60%)
+    '''
+    
+    # AlphaFold ordering: A R N D C Q E G H I L K M F P S T W Y V
+    # Hydrophilic: R(1), N(2), D(3), C(4), Q(5), E(6), H(8), K(11), S(15), T(16), Y(18) but exclude C to avoid conflict with disulfide loss
+    hydrophilic_indices = jnp.array([1, 2, 3, 5, 6, 8, 11, 15, 16, 18])
+    
+    def loss_fn(inputs, outputs):
+        if "seq" not in inputs:
+            return {"hydrophilic": jnp.array(0.0)}
+        
+        seq_input = inputs["seq"]
+        
+        # Use logits directly (the actual optimization variable)
+        if isinstance(seq_input, dict) and "logits" in seq_input:
+            seq_logits = seq_input["logits"]
+        else:
+            return {"hydrophilic": jnp.array(0.0)}
+        
+        # Remove batch dimension if present
+        if seq_logits.ndim == 3:
+            seq_logits = seq_logits[0]
+        
+        # Convert logits to probabilities
+        aa_probs = jax.nn.softmax(seq_logits, axis=-1)
+        
+        # Extract binder portion
+        binder_probs = aa_probs[-self._binder_len:, :]
+        
+        # Calculate hydrophilic residue probability
+        hydrophilic_probs = binder_probs[:, hydrophilic_indices].sum(axis=-1)
+        mean_hydrophilic_fraction = hydrophilic_probs.mean()
+        
+        # Loss
+        deviation = mean_hydrophilic_fraction - hydrophilic_preference
+        loss = jnp.square(deviation)
+        
+        return {"hydrophilic": loss}
+    
+    self._callbacks["model"]["loss"].append(loss_fn)
+    self.opt["weights"]["hydrophilic"] = weight
+
 # plot design trajectory losses
 def plot_trajectory(af_model, design_name, design_paths):
-    metrics_to_plot = ['loss', 'plddt', 'ptm', 'i_ptm', 'con', 'i_con', 'pae', 'i_pae', 'rg', 'NC', 'helix', 'disulfide', 'mpnn']
+    metrics_to_plot = ['loss', 'plddt', 'ptm', 'i_ptm', 'con', 'i_con', 'pae', 'i_pae', 'rg', 'NC', 'helix', 'disulfide', 'polar', 'charged', 'hydrophilic', 'mpnn']
     colors = ['b', 'g', 'r', 'c', 'm', 'y', 'k']
 
     for index, metric in enumerate(metrics_to_plot):

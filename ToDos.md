@@ -14,26 +14,24 @@ Disulfide peptide generation
 Partial Hallucination for AF2 design protocol (to combine with RFDiffusion)
     - protocol implementation   --> done
     - disulfide fixation (simplification of specification for head to tail cycl)    --> done
-    - test
+    - test  -->
     - ignore missing implementation
 
 
 Filtering based on RMSD to designed structure ? (maybe already included)
 
-Fix binder structure explotion after relaxation
+
+Add pre-filtering step directly after AF2 design protocol    --> done
 
 
-# Optimize ProteinMPNN usage (biases, ...)
-
-
-Add pre-filtering step directly after AF2 design protocol (filtering out unwanted secondary structures etc.)
+Add pre pre filtering of input pdb directly after secondary structure (for RFDiffusion inputs)
 
 
 Select MPNN designs after generating and evaluating all of them.
 
 
 Amino acid distribution losses during AF2 design protocol
-    - simple distriution loss
+    - simple distriution loss   --> done
     - ProteinMPNN distribution loss
 
 
