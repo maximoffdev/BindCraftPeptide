@@ -18,7 +18,15 @@ Partial Hallucination for AF2 design protocol (to combine with RFDiffusion)
     - ignore missing implementation
 
 
-Filtering based on RMSD to designed structure ? (maybe already included)
+Motif sequence fixation
+    - in advanced binder design protocol
+    - for proteinMPNN optimization
+
+
+disulfide check in filters if disulfide bridge has formed
+
+
++ length hallucination to provided binder motif in advanced binder design protocol
 
 
 Add pre-filtering step directly after AF2 design protocol    --> done

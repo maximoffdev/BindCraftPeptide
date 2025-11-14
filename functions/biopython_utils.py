@@ -206,7 +206,7 @@ def hotspot_residues(trajectory_pdb, binder_chain="B", atom_distance_cutoff=4.0)
     return interacting_residues
 
 # calculate secondary structure percentage of design
-def calc_ss_percentage(pdb_file, advanced_settings, chain_id="B", atom_distance_cutoff=4.0):
+def calc_ss_percentage(pdb_file, advanced_settings, chain_id="B", atom_distance_cutoff=4.0, sec_struct_only=False):
     # Parse the structure
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure('protein', pdb_file)
@@ -237,7 +237,7 @@ def calc_ss_percentage(pdb_file, advanced_settings, chain_id="B", atom_distance_
 
             ss_counts[ss_type] += 1
 
-            if ss_type != 'loop':
+            if ss_type != 'loop' and not sec_struct_only:
                 # calculate secondary structure normalised pLDDT
                 avg_plddt_ss = sum(atom.bfactor for atom in residue) / len(residue)
                 plddts_ss.append(avg_plddt_ss)
@@ -246,8 +246,9 @@ def calc_ss_percentage(pdb_file, advanced_settings, chain_id="B", atom_distance_
                 ss_interface_counts[ss_type] += 1
 
                 # calculate interface pLDDT
-                avg_plddt_residue = sum(atom.bfactor for atom in residue) / len(residue)
-                plddts_interface.append(avg_plddt_residue)
+                if not sec_struct_only:
+                    avg_plddt_residue = sum(atom.bfactor for atom in residue) / len(residue)
+                    plddts_interface.append(avg_plddt_residue)
 
     # Calculate percentages
     total_residues = sum(ss_counts.values())

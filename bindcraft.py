@@ -84,6 +84,31 @@ script_start_time = time.time()
 trajectory_n = 1
 accepted_designs = 0
 
+# Check secondary structure of binder chain in starting PDB
+if advanced_settings.get("initial_helix_check_cutoff", 100.0) < 100.0:
+    starting_pdb = target_settings["starting_pdb"]
+    binder_chain_id = "B"  # assuming binder is chain B
+    
+    # Calculate secondary structure percentages (sec_struct_only=True to skip pLDDT calculations)
+    helix_pct, sheet_pct, loop_pct, _, _, _, _, _ = calc_ss_percentage(
+        starting_pdb, 
+        advanced_settings, 
+        chain_id=binder_chain_id, 
+        sec_struct_only=True
+    )
+    
+    # Terminate if helical content detected in binder chain
+    if helix_pct > advanced_settings["initial_helix_check_cutoff"]:
+        print("-------------------------------------------------------------------------------------")
+        print(f"ERROR: Helical secondary structure detected in binder chain {binder_chain_id} ({helix_pct}% helix)")
+        print(f"The binder_advanced protocol does not support helical starting structures.")
+        print(f"Starting PDB: {starting_pdb}")
+        print("Program terminated.")
+        print("-------------------------------------------------------------------------------------")
+        sys.exit(1)
+    
+    print(f"Starting binder secondary structure check passed: {sheet_pct}% sheet, {loop_pct}% loop")
+
 ### start design loop
 while True:
     ### check if we have the target number of binders
@@ -226,9 +251,9 @@ while True:
                         trajectory_filters = prefilters
                         trajectory_filters_file = prefilters_file
                     else:
-                        print("No pre-filters file provided, skipping pre-filtering step...")
-                        trajectory_filters = None
-                        trajectory_filters_file = None
+                        print("No extra pre-filters file provided, using default filters...")
+                        trajectory_filters = filters
+                        trajectory_filters_file = filters_file
                 elif advanced_settings.get("direct_trajectory_filtering", False) or advanced_settings["enable_mpnn"] == False:
                     trajectory_filters = filters
                     trajectory_filters_file = filters_file

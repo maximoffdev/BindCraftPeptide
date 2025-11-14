@@ -13,7 +13,7 @@ from colabdesign import mk_afdesign_model, clear_mem
 from colabdesign.mpnn import mk_mpnn_model
 from colabdesign.af.alphafold.common import residue_constants
 from colabdesign.af.loss import get_ptm, mask_loss, get_dgram_bins, _get_con_loss
-from colabdesign.shared.utils import copy_dict
+from colabdesign.shared.utils import copy_dict, categorical
 from .biopython_utils import hotspot_residues, calculate_clash_score, calc_ss_percentage, calculate_percentages, get_chain_length
 from .pyrosetta_utils import pr_relax, align_pdbs, pr_staple_disulfides
 from . import pyrosetta_utils as pr_utils
@@ -52,50 +52,45 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
     elif protocol == "binder_advanced":
 
         # === ADVANCED POSITION CONTROL ===
-        # Four levels of control with strict hierarchy (fixed > template > sequence > redesign):
+        # Users can specify position control directly via advanced_settings:
         #
-        # 1. fixed_positions:     Keep sequence AND structure (e.g., catalytic sites, disulfides)
-        # 2. template_positions:  Keep structure, redesign sequence (e.g., preserve helix/sheet)
-        # 3. sequence_positions:  Keep sequence, allow movement (e.g., binding motif in flexible loop)
-        # 4. redesign_positions:  Full freedom for sequence and structure
+        # 1. fixed_positions:     Keep sequence AND structure (e.g., "1-3,10")
+        # 2. template_positions:  Keep structure, redesign sequence (e.g., "15-20")
+        # 3. sequence_positions:  Keep sequence, allow movement (e.g., "5-8")
+        # 4. redesign_positions:  Full freedom (default: all positions not specified above)
         #
-        # Positions are mutually exclusive - each position belongs to exactly one category
-        # based on priority order above.
+        # Disulfide pairs are automatically handled:
+        # - Always locked in sequence
+        # - Locked in structure if floating=False, allowed to move if floating=True
 
-        fixed_positions = None
-        template_positions = None
-        sequence_positions = None
-
-        if advanced_settings.get("floating", False):
-            # FLOATING MODE: Binder can move in space
-            # Fix sequence identity but allow structural rearrangement
-            print("Floating binder design selected - position not fixed, but sequence can be constrained.")
-            if ds_pairs and len(ds_pairs) > 0:
-                for (i, j) in ds_pairs:
-                    # Add disulfide positions to sequence-fixed (keep identity, allow movement)
-                    if advanced_settings["fixed_residues"] == "" or advanced_settings["fixed_residues"] is None:
-                        advanced_settings["fixed_residues"] = str(i+1) + "," + str(j+1)  # 1-based indexing
-                    else:
-                        advanced_settings["fixed_residues"] = advanced_settings["fixed_residues"] + "," + str(i+1) + "," + str(j+1)
-                    print(f"Fixing sequence identity of disulfide pair (can move): ({i+1}, {j+1})")
-            # In floating mode, fixed_residues become sequence_positions
-            sequence_positions = advanced_settings.get("fixed_residues", None)  # Keep sequence, redesign structure
-        else:
-            # FIXED MODE: Binder position is anchored in space
-            # Fix both sequence and structure for specified positions
-            print("Fixed binder redesign selected - positions anchored in space.")
-            if ds_pairs and len(ds_pairs) > 0:
-                for (i, j) in ds_pairs:
-                    # Add disulfide positions to fully fixed (keep sequence AND structure)
-                    if advanced_settings["fixed_residues"] == "" or advanced_settings["fixed_residues"] is None:
-                        advanced_settings["fixed_residues"] = str(i+1) + "," + str(j+1)  # 1-based indexing
-                    else:
-                        advanced_settings["fixed_residues"] = advanced_settings["fixed_residues"] + "," + str(i+1) + "," + str(j+1)
-                    print(f"Fixing structure AND sequence of disulfide pair: ({i+1}, {j+1})")
-            # In fixed mode, fixed_residues become fixed_positions (both seq + struct)
-            fixed_positions = advanced_settings.get("fixed_residues", None)  # Keep sequence AND structure
-            template_positions = advanced_settings.get("template_positions", None)  # Keep structure, redesign sequence
+        # Get user-specified position controls from advanced_settings
+        fixed_positions = advanced_settings.get("fixed_positions", None)
+        template_positions = advanced_settings.get("template_positions", None)
+        sequence_positions = advanced_settings.get("sequence_positions", None)
+        
+        # Handle disulfide pairs automatically
+        if ds_pairs and len(ds_pairs) > 0:
+            # Build comma-separated string of disulfide positions (1-based)
+            ds_pos_str = ','.join([f"{i+1},{j+1}" for (i, j) in ds_pairs])
             
+            if advanced_settings.get("floating", False):
+                # FLOATING MODE: Disulfides can move but keep sequence
+                print(f"Floating mode: Disulfide pairs locked in sequence only (can move)")
+                if sequence_positions:
+                    sequence_positions = f"{sequence_positions},{ds_pos_str}"
+                else:
+                    sequence_positions = ds_pos_str
+                for (i, j) in ds_pairs:
+                    print(f"  Disulfide pair ({i+1}, {j+1}): sequence locked, structure flexible")
+            else:
+                # FIXED MODE: Disulfides locked in both sequence and structure
+                print(f"Fixed mode: Disulfide pairs locked in sequence AND structure")
+                if fixed_positions:
+                    fixed_positions = f"{fixed_positions},{ds_pos_str}"
+                else:
+                    fixed_positions = ds_pos_str
+                for (i, j) in ds_pairs:
+                    print(f"  Disulfide pair ({i+1}, {j+1}): sequence AND structure locked")
 
         af_model.prep_inputs(
             pdb_filename=starting_pdb,
@@ -224,7 +219,7 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
     elif advanced_settings["design_algorithm"] == '4stage':
         # initial logits to prescreen trajectory
         print("Stage 1: Test Logits")
-        af_model.design_logits(iters=75, e_soft=0.9, models=design_models, num_models=1, sample_models=advanced_settings["sample_models"], save_best=True)
+        af_model.design_logits(iters=advanced_settings.get("logits_iterations", 50), e_soft=0.9, models=design_models, num_models=1, sample_models=advanced_settings["sample_models"], save_best=True)
 
         # determine pLDDT of best iteration according to lowest 'loss' value
         initial_plddt = get_best_plddt(af_model, length)
@@ -246,7 +241,8 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
                     print("Beta sheeted trajectory detected, optimising settings")
 
             # how many logit iterations left
-            logits_iter = advanced_settings["soft_iterations"] - 50
+            # logits_iter = advanced_settings["soft_iterations"] - 50
+            logits_iter = advanced_settings.get("soft_iterations", 0)
             if logits_iter > 0:
                 print("Stage 1: Additional Logits Optimisation")
                 af_model.clear_best()
@@ -290,8 +286,8 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
                         
                         af_model.design_pssm_semigreedy(soft_iters=0, hard_iters=advanced_settings["greedy_iterations"], tries=greedy_tries, models=design_models, 
                                                         num_models=1, sample_models=advanced_settings["sample_models"], ramp_models=False, save_best=True)
-                    elif advanced_settings.get("use_disulfide_loss", False):
-                        print("Disulfide loss active, skipping semigreedy optimisation")
+                    # elif advanced_settings.get("use_disulfide_loss", False):
+                    #     print("Disulfide loss active, skipping semigreedy optimisation")
 
                 else:
                     update_failures(failure_csv, 'Trajectory_one-hot_pLDDT')
@@ -434,9 +430,11 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
                     if comparison == '>=' and prediction_metrics[metric_key] < threshold:
                         pass_af2_filters = False
                         filter_failures[filter_name] = filter_failures.get(filter_name, 0) + 1
+                        print(f"Filter failed: Model {model_num+1} {metric_key} = {prediction_metrics[metric_key]} (threshold: {threshold})")
                     elif comparison == '<=' and prediction_metrics[metric_key] > threshold:
                         pass_af2_filters = False
                         filter_failures[filter_name] = filter_failures.get(filter_name, 0) + 1
+                        print(f"Filter failed: Model {model_num+1} {metric_key} = {prediction_metrics[metric_key]} (threshold: {threshold})")
 
             if not pass_af2_filters:
                 break
@@ -761,9 +759,9 @@ def add_polar_bias_loss(self, weight=0.1, polar_preference=0.5):
         polar_probs = binder_probs[:, polar_indices].sum(axis=-1)  # Shape: [binder_len]
         mean_polar_fraction = polar_probs.mean()
         
-        # Loss: squared deviation from target
+        # Loss: softer one-sided penalty
         deviation = mean_polar_fraction - polar_preference
-        loss = jnp.square(deviation)
+        loss = jnp.square(jax.nn.relu(-deviation))
         
         return {"polar": loss}
     
@@ -815,7 +813,7 @@ def add_charged_bias_loss(self, weight=0.1, charged_preference=0.3):
         
         # Loss
         deviation = mean_charged_fraction - charged_preference
-        loss = jnp.square(deviation)
+        loss = jnp.square(jax.nn.relu(-deviation))
         
         return {"charged": loss}
     
@@ -867,7 +865,7 @@ def add_hydrophilic_bias_loss(self, weight=0.1, hydrophilic_preference=0.6):
         
         # Loss
         deviation = mean_hydrophilic_fraction - hydrophilic_preference
-        loss = jnp.square(deviation)
+        loss = jnp.square(jax.nn.relu(-deviation))
         
         return {"hydrophilic": loss}
     
@@ -999,6 +997,173 @@ class mk_af_model_advanced(mk_af_model):
                            debug=debug,
                            data_dir=data_dir,
                            **kwargs)
+
+    def _binder_offset(self, sequence_length):
+        """Compute the starting index of the binder segment within a full sequence."""
+        binder_len = getattr(self, "_binder_len", sequence_length)
+        target_len = getattr(self, "_target_len", 0)
+        expected_total = target_len + binder_len
+
+        if sequence_length == binder_len:
+            return 0
+        if expected_total > 0 and sequence_length == expected_total:
+            return target_len
+        if sequence_length >= binder_len:
+            return max(0, sequence_length - binder_len)
+        return 0
+
+    def _apply_seq_grad_mask(self):
+        """Zero sequence gradients for binder positions that must remain fixed."""
+        if not hasattr(self, "aux") or "grad" not in self.aux:
+            return
+
+        grad_root = self.aux["grad"]
+        if not isinstance(grad_root, dict):
+            return
+
+        grad_seq = grad_root.get("seq")
+        if grad_seq is None:
+            return
+
+        mask_candidates = []
+        if "seq_grad_mask_binder" in self.opt:
+            mask_candidates.append(np.asarray(self.opt["seq_grad_mask_binder"], dtype=np.float32))
+        if "seq_grad_mask_global" in self.opt:
+            mask_candidates.append(np.asarray(self.opt["seq_grad_mask_global"], dtype=np.float32))
+
+        if not mask_candidates:
+            return
+
+        def _match_mask(arr):
+            if arr is None or not isinstance(arr, np.ndarray):
+                return None
+            for mask in mask_candidates:
+                if mask.ndim != 1:
+                    continue
+                if arr.ndim == 3 and mask.shape[0] == arr.shape[1]:
+                    return mask.astype(arr.dtype)
+                if arr.ndim == 2 and mask.shape[0] == arr.shape[0]:
+                    return mask.astype(arr.dtype)
+                if arr.ndim == 1 and mask.shape[0] == arr.shape[0]:
+                    return mask.astype(arr.dtype)
+            return None
+
+        def _apply(arr):
+            mask = _match_mask(arr)
+            if mask is None:
+                return
+            if arr.ndim == 3:
+                arr *= mask[None, :, None]
+            elif arr.ndim == 2:
+                arr *= mask[:, None]
+            elif arr.ndim == 1:
+                arr *= mask
+
+        if isinstance(grad_seq, dict):
+            _apply(grad_seq.get("logits"))
+            for key in ("pseudo", "onehot", "pssm"):
+                _apply(grad_seq.get(key))
+        elif isinstance(grad_seq, np.ndarray):
+            _apply(grad_seq)
+
+    def step(self, lr_scale=1.0, num_recycles=None,
+             num_models=None, sample_models=None, models=None, backprop=True,
+             callback=None, save_best=False, verbose=1):
+        """Override step to enforce gradient masking before applying updates."""
+
+        self.run(num_recycles=num_recycles, num_models=num_models, sample_models=sample_models,
+                 models=models, backprop=backprop, callback=callback)
+
+        self._apply_seq_grad_mask()
+
+        if self.opt["norm_seq_grad"]:
+            self._norm_seq_grad()
+
+        self._state, self.aux["grad"] = self._optimizer(self._state, self.aux["grad"], self._params)
+
+        lr = self.opt["learning_rate"] * lr_scale
+        self._params = jax.tree_map(lambda x, g: x - lr * g, self._params, self.aux["grad"])
+
+        self._save_results(save_best=save_best, verbose=verbose)
+        self._k += 1
+
+    def _mutate(self, seq, plddt=None, logits=None, mutation_rate=1):
+        """Override mutate to sample exclusively from designable binder positions."""
+        seq = np.array(seq)
+        N, L = seq.shape
+
+        binder_len = getattr(self, "_binder_len", L)
+        offset = self._binder_offset(L)
+        binder_window = min(binder_len, max(0, L - offset))
+
+        i_prob = np.zeros(L, dtype=np.float32)
+        if binder_window > 0:
+            i_prob[offset:offset + binder_window] = 1.0
+
+        if plddt is not None:
+            binder_plddt = np.maximum(1 - np.array(plddt), 0)
+            binder_plddt[np.isnan(binder_plddt)] = 0
+            usable = min(binder_window, binder_plddt.shape[-1])
+            if usable > 0:
+                i_prob[offset:offset + usable] = binder_plddt[:usable]
+                if usable < binder_window:
+                    remainder_slice = slice(offset + usable, offset + binder_window)
+                    i_prob[remainder_slice] = np.maximum(i_prob[remainder_slice], 1e-6)
+
+        i_prob[np.isnan(i_prob)] = 0
+
+        if "fix_pos" in self.opt:
+            if "pos" in self.opt:
+                p = self.opt["pos"][self.opt["fix_pos"]]
+                seq[..., p] = self._wt_aatype_sub
+            else:
+                p = self.opt["fix_pos"]
+                seq[..., p] = self._wt_aatype[..., p]
+            i_prob[p] = 0
+
+        binder_designable = np.asarray(self.opt.get("binder_designable", self.opt.get("pos", [])), dtype=int)
+        if binder_designable.size > 0:
+            allowed_mask = np.zeros(L, dtype=np.float32)
+            for idx in binder_designable:
+                pos = offset + int(idx)
+                if 0 <= pos < L:
+                    allowed_mask[pos] = 1.0
+            i_prob *= allowed_mask
+
+        forbidden_positions = np.asarray(self.opt.get("forbidden_positions", []), dtype=int)
+        if forbidden_positions.size > 0:
+            for idx in forbidden_positions:
+                pos = offset + int(idx)
+                if 0 <= pos < L:
+                    i_prob[pos] = 0
+
+        if i_prob.sum() <= 0:
+            return seq
+
+        for m in range(mutation_rate):
+            total_prob = i_prob.sum()
+            if total_prob <= 0:
+                break
+
+            probs = i_prob / total_prob
+            i = np.random.choice(np.arange(L), p=probs)
+
+            logits_array = np.array(0 if logits is None else logits)
+            if logits_array.ndim == 3:
+                logits_slice = logits_array[:, i]
+            elif logits_array.ndim == 2:
+                logits_slice = logits_array[i]
+            else:
+                logits_slice = logits_array
+
+            alphabet_size = self._args.get("alphabet_size", 20)
+            exclusion = np.eye(alphabet_size)[seq[:, i]] * 1e8
+            a_logits = logits_slice - exclusion
+            a = categorical(softmax(a_logits, axis=-1))
+
+            seq[:, i] = a
+
+        return seq
             
     def save_pdb_sanitized(self, filename, get_best=True, renum_pdb=True, aux=None):
         """
@@ -1307,15 +1472,30 @@ def prep_binder_advanced(af_model, pdb_filename,
 
     # === Set up designable positions (CRITICAL for sequence optimization) ===
     # Sequence-designable positions are ONLY: template_positions (keep structure) and redesign_positions (full freedom)
-    # Build global indices for designable positions (template + redesign)
-    designable_global = np.array(sorted([af_model._target_len + p for p in list(redesign_set | template_set)]), dtype=int)
+    binder_designable = np.array(sorted(list(redesign_set | template_set)), dtype=int)
+    designable_global = af_model._target_len + binder_designable
+
     # Exclude any positions that must keep sequence (fixed_set or sequence_set)
-    exclude_global = np.array(sorted([af_model._target_len + p for p in list(fixed_set | sequence_set)]), dtype=int)
-    if exclude_global.size > 0 and designable_global.size > 0:
-        designable_global = np.setdiff1d(designable_global, exclude_global)
-    af_model.opt["pos"] = designable_global
+    forbidden_positions = np.array(sorted(list(fixed_set | sequence_set)), dtype=int)
+    if forbidden_positions.size > 0:
+        mask = np.isin(binder_designable, forbidden_positions, invert=True)
+        binder_designable = binder_designable[mask]
+        designable_global = af_model._target_len + binder_designable
+
+    seq_grad_mask_global = np.zeros(sum(af_model._lengths), dtype=np.float32)
+    seq_grad_mask_global[designable_global] = 1.0
+    seq_grad_mask_binder = np.zeros(af_model._binder_len, dtype=np.float32)
+    seq_grad_mask_binder[binder_designable] = 1.0
+
+    af_model.opt["pos"] = binder_designable
+    af_model.opt["binder_designable"] = binder_designable
+    af_model.opt["designable_global"] = designable_global
+    af_model.opt["forbidden_positions"] = forbidden_positions
+    af_model.opt["seq_grad_mask_global"] = seq_grad_mask_global
+    af_model.opt["seq_grad_mask_binder"] = seq_grad_mask_binder
+
+    print(f"Sequence-designable positions (binder-local): {binder_designable}")
     print(f"Sequence-designable positions (global): {designable_global}")
-    print(f"  (template positions can change sequence, sequence positions cannot)")
 
     # Configure input features (following _prep_binder pattern)
     af_model._inputs = af_model._prep_features(num_res=sum(af_model._lengths), num_seq=1)
@@ -1337,6 +1517,7 @@ def prep_binder_advanced(af_model, pdb_filename,
     rm["rm_template"][:T] = False  # Keep target structure
     rm["rm_template_seq"][:T] = rm_target_seq
     rm["rm_template_sc"][:T] = rm_target_sc
+    print(f"Target template masking - remove seq: {rm_target_seq}, remove sc: {rm_target_sc} for target residues 0 to {T-1}")
 
     # === BINDER MASKING - apply masks according to strict hierarchy ===
     print(f"\n=== Position Control Summary (binder-local 0-based) ===")
@@ -1366,6 +1547,9 @@ def prep_binder_advanced(af_model, pdb_filename,
             rm["rm_template_seq"][global_pos] = True
             rm["rm_template_sc"][global_pos] = True
     
+    # print(rm["rm_template_seq"][:T])
+    # print(rm["rm_template_sc"][:T])
+
     # Set template options (following _prep_binder pattern)
     af_model.opt["template"] = {"rm_ic": False}
     af_model._inputs.update(rm)
@@ -1373,51 +1557,65 @@ def prep_binder_advanced(af_model, pdb_filename,
     # Prepare the model (following _prep_binder pattern - this is the final step)
     af_model._prep_model(**kwargs)
 
-    # === CRITICAL: Fix sequences for sequence-fixed and fixed positions ===
-    # ColabDesign uses a "bias" matrix to lock amino acid identities at specific positions
-    # We need to set a strong bias for positions that should keep their sequence
+    # CRITICAL FIX: Reapply positional metadata after model prep (restart resets opt)
+    preserved_opt_fields = {
+        "pos": binder_designable,
+        "binder_designable": binder_designable,
+        "designable_global": designable_global,
+        "forbidden_positions": forbidden_positions,
+        "seq_grad_mask_global": seq_grad_mask_global,
+        "seq_grad_mask_binder": seq_grad_mask_binder,
+    }
+
+    for key, value in preserved_opt_fields.items():
+        af_model.opt[key] = value
+        if hasattr(af_model, "_opt"):
+            af_model._opt[key] = value
+
+    # === CRITICAL FIX: Lock target sequence with extreme bias ===
+    # Prevent target sequence from being modified during optimization by applying
+    # extreme bias to all target positions. This works by making the softmax
+    # over sequence probabilities effectively deterministic for target residues.
+    target_aatype = af_model._pdb["batch"]["aatype"][:af_model._target_len]
+
+    existing_bias = af_model._inputs.get("bias")
+    if existing_bias is None:
+        bias = np.zeros((1, af_model._len, 20), dtype=np.float32)
+    else:
+        bias = existing_bias
+        # Ensure bias has batch dimension (shape should be [1, L, 20])
+        if bias.ndim == 2:
+            bias = bias[None, ...]
+
+    # Lock ALL target positions with extreme bias (±1000)
+    for pos in range(af_model._target_len):
+        wt_aa = int(target_aatype[pos])
+        bias[0, pos, :] = -1e6  # Extremely strong penalty for all AAs
+        bias[0, pos, wt_aa] = 1e6  # Extremely strong preference for wild-type AA
+
+    af_model._inputs["bias"] = bias
+    print(f"🔒 Target sequence locked (positions 0-{af_model._target_len-1})")
+
+    # === Lock binder sequence-fixed positions ===
+    # Apply strong bias to binder positions that should keep their sequence
     positions_to_lock = sorted(list(fixed_set | sequence_set))
     
     if len(positions_to_lock) > 0 and redesign:
         # Extract the wild-type sequence from the PDB for these positions
         wt_sequence = af_model._pdb["batch"]["aatype"][af_model._target_len:]
         
-        # Create or update bias matrix (shape: [1, binder_len, 20] for 20 amino acids)
-        existing_bias = af_model._inputs.get("bias")
-        if existing_bias is None:
-            # Create new bias matrix (no bias = 0, strong bias = large positive/negative values)
-            bias = np.zeros((1, af_model._len, 20), dtype=np.float32)
-        else:
-            bias = existing_bias
-            if bias.ndim == 2:
-                bias = bias[None, ...]
-            # Expand to full complex length if needed
-            if bias.shape[1] == af_model._binder_len:
-                full_bias = np.zeros((bias.shape[0], af_model._len, bias.shape[-1]), dtype=bias.dtype)
-                full_bias[:, af_model._target_len:, :] = bias[:, :af_model._binder_len, :]
-                bias = full_bias
+        # Use the bias matrix already created above
+        bias = af_model._inputs["bias"]
         
-        # For each position to lock, set strong bias for the wild-type amino acid
+        # Lock each binder position with extreme bias
         for pos in positions_to_lock:
             global_pos = af_model._target_len + pos
-            wt_aa = int(wt_sequence[pos])  # amino acid index (0-19)
-            # Set very strong bias (100.0) to lock this amino acid
-            bias[0, global_pos, :] = -100.0  # Penalize all amino acids
-            bias[0, global_pos, wt_aa] = 100.0  # Strongly favor wild-type
+            wt_aa = int(wt_sequence[pos])
+            bias[0, global_pos, :] = -1e3
+            bias[0, global_pos, wt_aa] = 1e3
         
         af_model._inputs["bias"] = bias
-        print(f"Applied sequence-locking bias to {len(positions_to_lock)} positions: {positions_to_lock}")
-    else:
-        # Handle existing bias for other cases (hallucination mode or no locked positions)
-        existing_bias = af_model._inputs.get("bias")
-        if existing_bias is not None:
-            bias = existing_bias
-            if bias.ndim == 2:
-                bias = bias[None, ...]
-            if bias.shape[1] == af_model._binder_len:
-                full_bias = np.zeros((bias.shape[0], af_model._len, bias.shape[-1]), dtype=bias.dtype)
-                full_bias[:, af_model._target_len:, :] = bias[:, :af_model._binder_len, :]
-                af_model._inputs["bias"] = full_bias
+        print(f"🔒 Binder sequence-fixed positions locked: {positions_to_lock}")
     
     # Store position information for later reference
     af_model._custom_positions = {
