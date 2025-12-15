@@ -1369,7 +1369,7 @@ def prep_binder_advanced(af_model, pdb_filename,
         # REDESIGN MODE: Extract existing binder sequence
         af_model._wt_aatype = af_model._pdb["batch"]["aatype"][af_model._target_len:]
         af_model.opt["weights"].update({
-            "dgram_cce": 1.0,
+            "dgram_cce": 0.1,
             "rmsd": 0.0,
             "fape": 0.0,
             "con": 0.0,
