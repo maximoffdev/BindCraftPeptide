@@ -55,6 +55,20 @@ def generate_directories(design_path):
 
     return design_paths
 
+def generate_directories_isolated(design_path):
+    design_path_names = ["Accepted", "Accepted/Ranked", "Accepted/Animation", "Accepted/Plots", "Accepted/Pickle", "Trajectory",
+                        "Trajectory/Relaxed", "Trajectory/Plots", "Trajectory/Clashing", "Trajectory/LowConfidence", "Trajectory/Animation",
+                        "Trajectory/Pickle", "Rejected"]
+    design_paths = {}
+
+    # make directories and set design_paths[FOLDER_NAME] variable
+    for name in design_path_names:
+        path = os.path.join(design_path, name)
+        os.makedirs(path, exist_ok=True)
+        design_paths[name] = path
+
+    return design_paths
+
 # generate CSV file for tracking designs not passing filters
 def generate_filter_pass_csv(failure_csv, filter_json):
     if not os.path.exists(failure_csv):

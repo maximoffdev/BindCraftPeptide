@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Design pipeline: AF2 design + optional MPNN redesign.
+Outputs trajectory PDBs and metrics CSVs (trajectory_stats.csv, mpnn_design_stats.csv, AF2_design_stats.csv, final_design_stats.csv, failure_csv.csv).
+This is a split-out version of the original bindcraft.py focused on the design stage only.
+"""
+import os
+import sys
+import argparse
+import time
+import numpy as np
+from functions import *
+
+
+def main():
+    # Ensure GPU is available (halts otherwise)
+    check_jax_gpu()
+
+    parser = argparse.ArgumentParser(description="BindCraft design stage (AF2 + optional MPNN)")
+    parser.add_argument("--settings", "-s", required=True, help="Path to basic settings.json")
+    parser.add_argument("--filters", "-f", default="./settings_filters/default_filters.json", help="Path to filters.json")
+    parser.add_argument("--advanced", "-a", default="./settings_advanced/default_4stage_multimer.json", help="Path to advanced settings json")
+    parser.add_argument("--prefilters", "-p", default=None, help="Optional prefilters json for trajectory pre-filtering")
+    args = parser.parse_args()
+
+    settings_path, filters_path, advanced_path, prefilters_path = perform_input_check(args)
+    target_settings, advanced_settings, filters, prefilters = load_json_settings(settings_path, filters_path, advanced_path, prefilters_path)
+
+    settings_file = os.path.basename(settings_path).split(".")[0]
+    filters_file = os.path.basename(filters_path).split(".")[0]
+    advanced_file = os.path.basename(advanced_path).split(".")[0]
+    prefilters_file = os.path.basename(prefilters_path).split(".")[0] if prefilters_path else None
+
+    design_models, prediction_models, multimer_validation = load_af2_models(advanced_settings["use_multimer_design"])
+    bindcraft_folder = os.path.dirname(os.path.realpath(__file__))
+    advanced_settings = perform_advanced_settings_check(advanced_settings, bindcraft_folder)
+
+    design_paths = generate_directories_isolated(target_settings["design_path"])
+    trajectory_labels, design_labels, final_labels = generate_dataframe_labels()
+
+    trajectory_csv = os.path.join(target_settings["design_path"], "trajectory_stats.csv")
+    # mpnn_csv = os.path.join(target_settings["design_path"], "mpnn_design_stats.csv")
+    # AF2_design_csv = os.path.join(target_settings["design_path"], "AF2_design_stats.csv")
+    # final_csv = os.path.join(target_settings["design_path"], "final_design_stats.csv")
+    failure_csv = os.path.join(target_settings["design_path"], "failure_csv.csv")
+
+    create_dataframe(trajectory_csv, trajectory_labels)
+    # create_dataframe(mpnn_csv, design_labels)
+    # create_dataframe(AF2_design_csv, design_labels)
+    # create_dataframe(final_csv, final_labels)
+    generate_filter_pass_csv(failure_csv, args.filters)
+
+    pr.init(f'-ignore_unrecognized_res -ignore_zero_occupancy -mute all -holes:dalphaball {advanced_settings["dalphaball_path"]} -corrections::beta_nov16 true -relax:default_repeats 1')
+    print(f"Running binder design for target {settings_file}")
+    print(f"Design settings used: {advanced_file}")
+    # print(f"Filtering designs based on {filters_file}")
+    # if prefilters_file is not None and advanced_settings.get("pre_filter_trajectory", False):
+    #     print(f"Pre-filtering trajectories based on {prefilters_file}")
+    # elif prefilters_file is None and advanced_settings.get("pre_filter_trajectory", False):
+    #     print("-------------------------------------------------------------------------------------")
+    #     print("Warning: pre_filter_trajectory is enabled but no prefilters file provided, exiting...")
+    #     print("-------------------------------------------------------------------------------------")
+    #     sys.exit(1)
+
+    script_start_time = time.time()
+    trajectory_n = 1
+    accepted_designs = 0
+
+    # Optional starting PDB helix check
+    if advanced_settings.get("initial_helix_check_cutoff", 100.0) < 100.0:
+        starting_pdb = target_settings["starting_pdb"]
+        binder_chain_id = "B"
+        helix_pct, sheet_pct, loop_pct, *_ = calc_ss_percentage(starting_pdb, advanced_settings, chain_id=binder_chain_id, sec_struct_only=True)
+        if helix_pct > advanced_settings["initial_helix_check_cutoff"]:
+            print("-------------------------------------------------------------------------------------")
+            print(f"ERROR: Helical secondary structure detected in binder chain {binder_chain_id} ({helix_pct}% helix)")
+            print("The binder_advanced protocol does not support helical starting structures.")
+            print(f"Starting PDB: {starting_pdb}")
+            print("Program terminated.")
+            print("-------------------------------------------------------------------------------------")
+            sys.exit(1)
+        print(f"Starting binder secondary structure check passed: {sheet_pct}% sheet, {loop_pct}% loop")
+
+    while True:
+
+        if check_n_trajectories(design_paths, advanced_settings):
+            break
+
+        trajectory_start_time = time.time()
+        seed = int(np.random.randint(0, high=999999, size=1, dtype=int)[0])
+
+        if target_settings.get("protocol", "binder") == "binder_advanced":
+            length = get_chain_length(target_settings["starting_pdb"], "B")
+        elif target_settings.get("protocol", "binder") == "binder":
+            min_length = min(target_settings["lengths"])
+            max_length = max(target_settings["lengths"]) if max(target_settings["lengths"]) > min_length else min_length
+            samples = np.arange(min_length, max_length + 1)
+            length = np.random.choice(samples)
+        else:
+            print(f"Invalid protocol specified in settings.json, {target_settings.get('protocol', 'None')}, exiting...")
+            sys.exit(1)
+
+        ds_pairs = []
+        ds_pairs_pre = advanced_settings.get("disulfide_pairs")
+        if ds_pairs_pre:
+            valid = True
+            seen = set()
+            for (i, j) in ds_pairs_pre:
+                if j == -1:
+                    j = length - 1
+                if i == j or i < 0 or j < 0 or i >= length or j >= length:
+                    valid = False; break
+                if abs(i - j) < advanced_settings.get("disulfide_min_sep", 5):
+                    valid = False; break
+                if i in seen or j in seen:
+                    valid = False; break
+                seen.add(i); seen.add(j)
+                ds_pairs.append((i, j))
+            if not valid:
+                ds_pairs = []
+
+        helicity_value = load_helicity(advanced_settings)
+        design_name = f"{target_settings['binder_name']}_l{length}_s{seed}"
+        trajectory_dirs = ["Trajectory", "Trajectory/Relaxed", "Trajectory/LowConfidence", "Trajectory/Clashing"]
+        trajectory_exists = any(os.path.exists(os.path.join(design_paths[td], design_name + ".pdb")) for td in trajectory_dirs)
+
+        if trajectory_exists:
+            trajectory_n += 1
+            continue
+
+        print(f"Starting trajectory: {design_name}")
+        trajectory = binder_hallucination(design_name, target_settings["starting_pdb"], target_settings.get("protocol", "binder"), target_settings["chains"],
+                                           target_settings.get("target_hotspot_residues", None), target_settings.get("pos", None), length, seed, ds_pairs, helicity_value,
+                                           design_models, advanced_settings, design_paths, failure_csv)
+        trajectory_metrics = copy_dict(trajectory._tmp["best"]["aux"]["log"])
+        trajectory_pdb = os.path.join(design_paths["Trajectory"], design_name + ".pdb")
+        trajectory_metrics = {k: round(v, 2) if isinstance(v, float) else v for k, v in trajectory_metrics.items()}
+
+        trajectory_time = time.time() - trajectory_start_time
+        trajectory_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(trajectory_time // 3600), int((trajectory_time % 3600) // 60), int(trajectory_time % 60))}"
+        print(f"Starting trajectory took: {trajectory_time_text}\n")
+
+        if trajectory.aux["log"].get("terminate", "") == "":
+            trajectory_relaxed = os.path.join(design_paths["Trajectory/Relaxed"], design_name + ".pdb")
+            pr_relax(trajectory_pdb, trajectory_relaxed)
+            binder_chain = "B"
+
+            num_clashes_trajectory = calculate_clash_score(trajectory_pdb)
+            num_clashes_relaxed = calculate_clash_score(trajectory_relaxed)
+            (trajectory_alpha, trajectory_beta, trajectory_loops,
+             trajectory_alpha_interface, trajectory_beta_interface, trajectory_loops_interface,
+             trajectory_i_plddt, trajectory_ss_plddt) = calc_ss_percentage(trajectory_pdb, advanced_settings, binder_chain)
+
+            trajectory_interface_scores, trajectory_interface_AA, trajectory_interface_residues = score_interface(trajectory_relaxed, binder_chain)
+            trajectory_sequence = trajectory.get_seq(get_best=True)[0]
+            traj_seq_notes = validate_design_sequence(trajectory_sequence, num_clashes_relaxed, advanced_settings)
+            trajectory_target_rmsd = target_pdb_rmsd(trajectory_pdb, target_settings["starting_pdb"], target_settings["chains"])
+
+            trajectory_data = [design_name, advanced_settings["design_algorithm"], length, seed, helicity_value, target_settings.get("target_hotspot_residues", ""), trajectory_sequence, trajectory_interface_residues,
+                               trajectory_metrics.get('plddt'), trajectory_metrics.get('ptm'), trajectory_metrics.get('i_ptm'), trajectory_metrics.get('pae'), trajectory_metrics.get('i_pae'),
+                               trajectory_i_plddt, trajectory_ss_plddt, num_clashes_trajectory, num_clashes_relaxed, trajectory_interface_scores['binder_score'],
+                               trajectory_interface_scores['surface_hydrophobicity'], trajectory_interface_scores['interface_sc'], trajectory_interface_scores['interface_packstat'],
+                               trajectory_interface_scores['interface_dG'], trajectory_interface_scores['interface_dSASA'], trajectory_interface_scores['interface_dG_SASA_ratio'],
+                               trajectory_interface_scores['interface_fraction'], trajectory_interface_scores['interface_hydrophobicity'], trajectory_interface_scores['interface_nres'], trajectory_interface_scores['interface_interface_hbonds'],
+                               trajectory_interface_scores['interface_hbond_percentage'], trajectory_interface_scores['interface_delta_unsat_hbonds'], trajectory_interface_scores['interface_delta_unsat_hbonds_percentage'],
+                               trajectory_alpha_interface, trajectory_beta_interface, trajectory_loops_interface, trajectory_alpha, trajectory_beta, trajectory_loops, trajectory_interface_AA, trajectory_target_rmsd,
+                               trajectory_time_text, traj_seq_notes, settings_file, filters_file, advanced_file]
+            insert_data(trajectory_csv, trajectory_data)
+
+            if not trajectory_interface_residues:
+                print(f"No interface residues found for {design_name}, skipping MPNN optimization")
+            elif advanced_settings["enable_mpnn"]:
+                mpnn_n = 1
+                accepted_mpnn = 0
+                design_start_time = time.time()
+                mpnn_trajectories = mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residues, advanced_settings)
+
+                # Save complete (target+binder) sequences for all sampled MPNN outputs
+                mpnn_complete_dir = os.path.join(target_settings["design_path"], "mpnn_seqs_complete")
+                os.makedirs(mpnn_complete_dir, exist_ok=True)
+                for n in range(advanced_settings["num_seqs"]):
+                    full_seq = mpnn_trajectories['seq'][n]
+                    fasta_name = os.path.join(mpnn_complete_dir, f"{design_name}_mpnn{n+1}_complete.fasta")
+                    with open(fasta_name, "w") as fh:
+                        fh.write(f">{design_name}_mpnn{n+1}\n{full_seq}\n")
+
+                # existing_mpnn_sequences = set(pd.read_csv(mpnn_csv, usecols=['Sequence'])['Sequence'].values)
+                restricted_AAs = set(aa.strip().upper() for aa in advanced_settings["omit_AAs"].split(',')) if advanced_settings.get("force_reject_AA") else set()
+
+                mpnn_sequences = sorted({
+                    mpnn_trajectories['seq'][n][-length:]: {
+                        'seq': mpnn_trajectories['seq'][n][-length:],
+                        'score': mpnn_trajectories['score'][n],
+                        'seqid': mpnn_trajectories['seqid'][n]
+                    } for n in range(advanced_settings["num_seqs"])
+                    if (not restricted_AAs or not any(aa in mpnn_trajectories['seq'][n][-length:].upper() for aa in restricted_AAs))
+                    and mpnn_trajectories['seq'][n][-length:] #not in existing_mpnn_sequences
+                }.values(), key=lambda x: x['score'])
+                # del existing_mpnn_sequences
+
+                # if mpnn_sequences:
+                #     if advanced_settings["save_mpnn_fasta"] is True:
+                #         save_fasta(design_name, mpnn_trajectories['seq'][n][-length:], design_paths)
+                #     if advanced_settings.get("optimise_beta") and float(trajectory_beta) > 15:
+                #         advanced_settings["num_recycles_validation"] = advanced_settings["optimise_beta_recycles_valid"]
+
+                #     clear_mem()
+                #     complex_prediction_model, binder_prediction_model = init_prediction_models(
+                #         trajectory_pdb=trajectory_pdb,
+                #         length=length,
+                #         mk_afdesign_model=mk_afdesign_model,
+                #         multimer_validation=multimer_validation,
+                #         target_settings=target_settings,
+                #         advanced_settings=advanced_settings
+                #     )
+
+                #     for mpnn_sequence in mpnn_sequences:
+                #         filter_conditions, mpnn_csv_out, failure_csv_out, final_csv_out = filter_design(
+                #             sequence=mpnn_sequence,
+                #             basis_design_name=design_name,
+                #             design_paths=design_paths,
+                #             trajectory_pdb=trajectory_pdb,
+                #             length=length,
+                #             helicity_value=helicity_value,
+                #             seed=seed,
+                #             prediction_models=prediction_models,
+                #             binder_chain=binder_chain,
+                #             filters=filters,
+                #             design_labels=design_labels,
+                #             target_settings=target_settings,
+                #             advanced_settings=advanced_settings,
+                #             advanced_file=advanced_file,
+                #             settings_file=settings_file,
+                #             filters_file=filters_file,
+                #             stats_csv=mpnn_csv,
+                #             failure_csv=failure_csv,
+                #             final_csv=final_csv,
+                #             complex_prediction_model=complex_prediction_model,
+                #             binder_prediction_model=binder_prediction_model,
+                #             is_mpnn_model=True,
+                #             mpnn_n=mpnn_n
+                #         )
+                #         mpnn_n += 1
+                #         if filter_conditions is True:
+                #             accepted_mpnn += 1
+                #         if accepted_mpnn >= advanced_settings["max_mpnn_sequences"]:
+                #             break
+
+                #     design_time = time.time() - design_start_time
+                #     design_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(design_time // 3600), int((design_time % 3600) // 60), int(design_time % 60))}"
+                #     print(f"MPNN redesign for trajectory {design_name} took: {design_time_text}\n")
+                # else:
+                #     print('No unique MPNN sequences after filtering omit_AAs/duplicates')
+
+            # acceptance monitoring
+            # if trajectory_n >= advanced_settings.get("start_monitoring", 1000) and advanced_settings.get("enable_rejection_check", False):
+            #     acceptance = accepted_designs / trajectory_n if trajectory_n else 0
+            #     if acceptance < advanced_settings.get("acceptance_rate", 0):
+            #         print("Acceptance rate below threshold, stopping early")
+            #         break
+
+        trajectory_n += 1
+        gc.collect()
+
+    elapsed_time = time.time() - script_start_time
+    elapsed_text = f"{'%d hours, %d minutes, %d seconds' % (int(elapsed_time // 3600), int((elapsed_time % 3600) // 60), int(elapsed_time % 60))}"
+    print(f"Finished all designs. Ran {trajectory_n} trajectories in {elapsed_text}")
+
+
+if __name__ == "__main__":
+    main()

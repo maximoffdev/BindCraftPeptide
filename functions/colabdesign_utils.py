@@ -424,20 +424,21 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
             ]
 
             # perform initial AF2 values filtering to determine whether to skip relaxation and interface scoring
-            for filter_name, metric_key, comparison in filter_conditions:
-                threshold = filters.get(filter_name, {}).get("threshold")
-                if threshold is not None:
-                    if comparison == '>=' and prediction_metrics[metric_key] < threshold:
-                        pass_af2_filters = False
-                        filter_failures[filter_name] = filter_failures.get(filter_name, 0) + 1
-                        print(f"Filter failed: Model {model_num+1} {metric_key} = {prediction_metrics[metric_key]} (threshold: {threshold})")
-                    elif comparison == '<=' and prediction_metrics[metric_key] > threshold:
-                        pass_af2_filters = False
-                        filter_failures[filter_name] = filter_failures.get(filter_name, 0) + 1
-                        print(f"Filter failed: Model {model_num+1} {metric_key} = {prediction_metrics[metric_key]} (threshold: {threshold})")
+            if filters is not None:
+                for filter_name, metric_key, comparison in filter_conditions:
+                    threshold = filters.get(filter_name, {}).get("threshold")
+                    if threshold is not None:
+                        if comparison == '>=' and prediction_metrics[metric_key] < threshold:
+                            pass_af2_filters = False
+                            filter_failures[filter_name] = filter_failures.get(filter_name, 0) + 1
+                            print(f"Filter failed: Model {model_num+1} {metric_key} = {prediction_metrics[metric_key]} (threshold: {threshold})")
+                        elif comparison == '<=' and prediction_metrics[metric_key] > threshold:
+                            pass_af2_filters = False
+                            filter_failures[filter_name] = filter_failures.get(filter_name, 0) + 1
+                            print(f"Filter failed: Model {model_num+1} {metric_key} = {prediction_metrics[metric_key]} (threshold: {threshold})")
 
-            if not pass_af2_filters:
-                break
+                if not pass_af2_filters:
+                    break
 
     # Update the CSV file with the failure counts
     if filter_failures:
