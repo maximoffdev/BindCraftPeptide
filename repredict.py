@@ -76,7 +76,7 @@ def main():
 
     design_paths = generate_directories_isolated(target_settings["design_path"])
 
-    # Reprediction outputs for AF2 trajectory PDBs
+    # Reprediction outputs (used for both trajectory PDBs and MPNN FASTA inputs)
     repred_base = os.path.join(target_settings["design_path"], "Repredicted")
     repred_relaxed = os.path.join(repred_base, "Relaxed")
     repred_binder = os.path.join(repred_base, "Binder")
@@ -87,18 +87,6 @@ def main():
     design_paths.setdefault("Repredicted/Relaxed", repred_relaxed)
     design_paths.setdefault("Repredicted/Binder", repred_binder)
     design_paths.setdefault("Repredicted/Best", repred_best)
-
-    # Reprediction outputs for MPNN FASTA inputs
-    repred_mpnn_base = os.path.join(target_settings["design_path"], "Repredicted_MPNN")
-    repred_mpnn_relaxed = os.path.join(repred_mpnn_base, "Relaxed")
-    repred_mpnn_binder = os.path.join(repred_mpnn_base, "Binder")
-    repred_mpnn_best = os.path.join(repred_mpnn_base, "Best")
-    for path in [repred_mpnn_base, repred_mpnn_relaxed, repred_mpnn_binder, repred_mpnn_best]:
-        os.makedirs(path, exist_ok=True)
-    design_paths.setdefault("Repredicted_MPNN", repred_mpnn_base)
-    design_paths.setdefault("Repredicted_MPNN/Relaxed", repred_mpnn_relaxed)
-    design_paths.setdefault("Repredicted_MPNN/Binder", repred_mpnn_binder)
-    design_paths.setdefault("Repredicted_MPNN/Best", repred_mpnn_best)
     trajectory_labels, design_labels, final_labels = generate_dataframe_labels()
 
     repredict_csv = os.path.join(target_settings["design_path"], "repredict_stats.csv")
@@ -111,12 +99,15 @@ def main():
     pdb_paths = sorted(pdb_dir.glob("*.pdb"))
     print(f"Found {len(pdb_paths)} PDBs in {pdb_dir}")
 
-    mpnn_fasta_dir = Path(target_settings["design_path"]) / "mpnn_seqs_complete"
-    mpnn_fasta_paths = sorted(mpnn_fasta_dir.glob("*.fasta"))
+    mpnn_fasta_dir = Path(target_settings["design_path"]) / "trajectory_fastas"
+    mpnn_fasta_paths = sorted(
+        p for p in mpnn_fasta_dir.glob("*.fasta")
+        if "mpnn" in p.name.lower()
+    )
     print(f"Found {len(mpnn_fasta_paths)} MPNN FASTAs in {mpnn_fasta_dir}")
 
     if not pdb_paths and not mpnn_fasta_paths:
-        print("No inputs found in Trajectory/*.pdb or mpnn_seqs_complete/*.fasta")
+        print("No inputs found in Trajectory/*.pdb or trajectory_fastas/*.fasta")
         sys.exit(1)
 
     for pdb_path in pdb_paths:
@@ -234,7 +225,7 @@ def main():
             binder_prediction_model=binder_prediction_model,
             is_mpnn_model=False,
             mpnn_n=None,
-            design_path_key="Repredicted_MPNN"
+            design_path_key="Repredicted"
         )
 
         clear_mem()

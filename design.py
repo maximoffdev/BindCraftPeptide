@@ -11,6 +11,21 @@ import numpy as np
 from functions import *
 
 
+def extract_chain_sequence_from_pdb(pdb_path, chain_id):
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("pdb", pdb_path)
+    model = structure[0]
+    if chain_id not in model:
+        raise KeyError(f"Chain '{chain_id}' not found in {pdb_path}")
+    chain = model[chain_id]
+    seq = []
+    for residue in chain:
+        if not is_aa(residue, standard=True):
+            continue
+        seq.append(three_to_one_map.get(residue.get_resname(), 'X'))
+    return ''.join(seq)
+
+
 def main():
     # Ensure GPU is available (halts otherwise)
     check_jax_gpu()
@@ -135,6 +150,20 @@ def main():
         trajectory_pdb = os.path.join(design_paths["Trajectory"], design_name + ".pdb")
         trajectory_metrics = {k: round(v, 2) if isinstance(v, float) else v for k, v in trajectory_metrics.items()}
 
+        # Save the (target+binder) trajectory sequence as FASTA alongside MPNN FASTAs
+        try:
+            trajectory_fastas_dir = os.path.join(target_settings["design_path"], "trajectory_fastas")
+            os.makedirs(trajectory_fastas_dir, exist_ok=True)
+            target_chain_ids = [c.strip() for c in str(target_settings.get("chains", "A")).split(',') if c.strip()]
+            binder_chain_id = target_settings.get("binder_chain", "B")
+            chain_ids_in_order = target_chain_ids + [binder_chain_id]
+            full_seq = "/".join(extract_chain_sequence_from_pdb(trajectory_pdb, c) for c in chain_ids_in_order)
+            fasta_name = os.path.join(trajectory_fastas_dir, f"{design_name}_complete.fasta")
+            with open(fasta_name, "w") as fh:
+                fh.write(f">{design_name}\n{full_seq}\n")
+        except Exception as exc:
+            print(f"Warning: could not write trajectory FASTA for {design_name}: {exc}")
+
         trajectory_time = time.time() - trajectory_start_time
         trajectory_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(trajectory_time // 3600), int((trajectory_time % 3600) // 60), int(trajectory_time % 60))}"
         print(f"Starting trajectory took: {trajectory_time_text}\n")
@@ -175,7 +204,7 @@ def main():
                 mpnn_trajectories = mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residues, advanced_settings)
 
                 # Save complete (target+binder) sequences for all sampled MPNN outputs
-                mpnn_complete_dir = os.path.join(target_settings["design_path"], "mpnn_seqs_complete")
+                mpnn_complete_dir = os.path.join(target_settings["design_path"], "trajectory_fastas")
                 os.makedirs(mpnn_complete_dir, exist_ok=True)
                 for n in range(advanced_settings["num_seqs"]):
                     full_seq = mpnn_trajectories['seq'][n]
