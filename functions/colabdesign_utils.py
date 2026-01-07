@@ -96,9 +96,13 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
             pdb_filename=starting_pdb,
             target_chain="A",
             binder_chain="B",
+            binder_len=length,
             fixed_positions=fixed_positions,
             template_positions=template_positions,
             sequence_positions=sequence_positions,
+            seed=seed,
+            init_binder_seq=advanced_settings.get("init_binder_seq_runtime"),
+            init_binder_locked_map=advanced_settings.get("init_binder_locked_map_runtime"),
             hotspot=target_hotspot_residues,
             rm_target_sc=advanced_settings["rm_template_sc_design"],
             rm_target_seq=advanced_settings["rm_template_seq_design"]
@@ -141,18 +145,32 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
                                                                        advanced_settings.get("disulfide_num", 1), 
                                                                        advanced_settings.get("disulfide_min_sep", 5))
         else:
-            # construct binder-only sequence pattern with Cs
-            sp = ["X"] * length
-            for i, j in ds_pairs:
-                sp[i] = "C"; sp[j] = "C"
-            sequence_pattern = "".join(sp)
+            # keep provided pattern; actual cysteine enforcement is done via bias below
+            sequence_pattern = None
 
         if ds_pairs and len(ds_pairs) > 0:
-            # seed sequence and restrict additional cysteines
+            # Enforce cysteines at disulfide sites via bias (avoid restart())
             try:
-                af_model.restart(seq=sequence_pattern, add_seq=True, rm_aa='C')
+                restype_order = getattr(residue_constants, "restype_order", None)
+                if restype_order is None:
+                    restype_order = {aa: i for i, aa in enumerate(list("ARNDCQEGHILKMFPSTWYV"))}
+                c_idx = restype_order.get("C")
+                if c_idx is not None:
+                    bias = af_model._inputs.get("bias")
+                    if bias is None:
+                        bias = np.zeros((1, af_model._len, 20), dtype=np.float32)
+                    elif bias.ndim == 2:
+                        bias = bias[None, ...]
+
+                    T = int(getattr(af_model, "_target_len", 0))
+                    for i, j in ds_pairs:
+                        for idx0 in (int(i), int(j)):
+                            if 0 <= idx0 < int(length):
+                                g = T + idx0
+                                bias[0, g, :] = -1e3
+                                bias[0, g, c_idx] = 1e3
+                    af_model._inputs["bias"] = bias
             except Exception:
-                # if restart fails (API differences), continue without seeding
                 pass
             # store pattern for loss and downstream stapling
             af_model.opt["disulfide_pattern"] = ds_pairs
@@ -1308,12 +1326,17 @@ def prep_binder_advanced(af_model, pdb_filename,
         )
     """
     
-    # Parse the PDB structure first to check what's in it
-    chains_to_load = f"{target_chain},{binder_chain}" if binder_chain else target_chain
+    # Parse the PDB structure.
+    # In hallucination mode (binder_len provided), do NOT load the existing binder chain even if present,
+    # otherwise we'd double-count residues and produce inconsistent feature lengths.
+    if binder_len is not None:
+        chains_to_load = target_chain
+    else:
+        chains_to_load = f"{target_chain},{binder_chain}" if binder_chain else target_chain
     im = [True] * len(chains_to_load.split(","))
     af_model._pdb = prep_pdb(pdb_filename, chain=chains_to_load, ignore_missing=im)
     
-    # Check if binder exists in PDB
+    # Check if binder exists in PDB (only meaningful when we loaded it)
     available_chains = set(af_model._pdb["idx"]["chain"])
     has_binder_in_pdb = binder_chain in available_chains
     
@@ -1355,6 +1378,13 @@ def prep_binder_advanced(af_model, pdb_filename,
     # CRITICAL: _len must be FULL complex length for proper sequence initialization
     af_model._lengths = [af_model._target_len, af_model._binder_len]
     af_model._len = sum(af_model._lengths)
+
+    # Sanity check: residue_index should match full complex length
+    if len(res_idx) != af_model._len:
+        raise ValueError(
+            f"prep_binder_advanced: residue_index length {len(res_idx)} != full length {af_model._len}. "
+            f"target_len={af_model._target_len}, binder_len={af_model._binder_len}, redesign={redesign}"
+        )
     
     print(f"Target length: {af_model._target_len}, Binder length: {af_model._binder_len}")
     
@@ -1396,6 +1426,9 @@ def prep_binder_advanced(af_model, pdb_filename,
     sequence_pos_array = np.array([], dtype=int)
     redesign_pos_array = np.arange(af_model._binder_len)  # Default: all positions
     
+    init_binder_seq = kwargs.pop("init_binder_seq", None)
+    init_binder_locked_map = kwargs.pop("init_binder_locked_map", None)
+
     # Helper function to parse positions with chain-aware handling
     def parse_binder_positions(pos_string, binder_chain):
         """
@@ -1404,6 +1437,47 @@ def prep_binder_advanced(af_model, pdb_filename,
         """
         if pos_string is None or pos_string == "":
             return np.array([], dtype=int)
+
+        # In hallucination mode, we cannot rely on prep_pos because the binder segment
+        # does not exist in the input PDB indexing. Parse binder-local positions directly.
+        if not redesign:
+            s = str(pos_string).replace(" ", "")
+            if not s:
+                return np.array([], dtype=int)
+
+            vals_1b = []
+            for part in s.split(","):
+                if not part:
+                    continue
+                # strip optional leading chain letter (e.g., "B12" -> "12")
+                if len(part) >= 2 and part[0].isalpha() and (part[1].isdigit() or part[1] == '-'):
+                    part = part[1:]
+                # ranges like 1-3
+                if "-" in part[1:]:
+                    a_str, b_str = part.split("-", 1)
+                    try:
+                        a = int(a_str)
+                        b = int(b_str)
+                    except ValueError:
+                        continue
+                    step = 1 if b >= a else -1
+                    for v in range(a, b + step, step):
+                        vals_1b.append(v)
+                else:
+                    try:
+                        vals_1b.append(int(part))
+                    except ValueError:
+                        continue
+
+            # convert 1-based -> 0-based, discard out-of-range
+            out = []
+            for p1 in vals_1b:
+                if p1 <= 0:
+                    continue
+                p0 = p1 - 1
+                if 0 <= p0 < int(af_model._binder_len):
+                    out.append(p0)
+            return np.array(sorted(set(out)), dtype=int)
         
         # Check if positions already have chain prefix (e.g., "B116,B117")
         if any(c.isalpha() for c in pos_string.split(',')[0].split('-')[0]):
@@ -1446,7 +1520,7 @@ def prep_binder_advanced(af_model, pdb_filename,
     
     # Build mutually-exclusive position sets immediately so we can correctly
     # determine which positions are sequence-designable (template + redesign)
-    binder_len_local = int(af_model._binder_len)
+    binder_len_local = int(af_model._binder_len or 0)
     all_binder_pos = set(range(binder_len_local))
     fixed_set = set(fixed_pos_array)
     template_set = set(template_pos_array) - fixed_set
@@ -1482,7 +1556,7 @@ def prep_binder_advanced(af_model, pdb_filename,
 
     seq_grad_mask_global = np.zeros(sum(af_model._lengths), dtype=np.float32)
     seq_grad_mask_global[designable_global] = 1.0
-    seq_grad_mask_binder = np.zeros(af_model._binder_len, dtype=np.float32)
+    seq_grad_mask_binder = np.zeros(int(af_model._binder_len or 0), dtype=np.float32)
     seq_grad_mask_binder[binder_designable] = 1.0
 
     af_model.opt["pos"] = binder_designable
@@ -1593,6 +1667,64 @@ def prep_binder_advanced(af_model, pdb_filename,
 
     af_model._inputs["bias"] = bias
     print(f"🔒 Target sequence locked (positions 0-{af_model._target_len-1})")
+
+    # === Apply initial binder sequence / locks (works in redesign and hallucination) ===
+    # Use bias seeding to avoid relying on restart(seq=...), which can reset opt fields.
+    binder_restype_order = getattr(residue_constants, "restype_order", None)
+    if binder_restype_order is None:
+        binder_restype_order = {aa: i for i, aa in enumerate(list("ARNDCQEGHILKMFPSTWYV"))}
+
+    if init_binder_seq:
+        init_binder_seq = str(init_binder_seq).strip().upper()
+        binder_len_int = int(af_model._binder_len or 0)
+        if len(init_binder_seq) != binder_len_int:
+            print(f"Warning: init_binder_seq length {len(init_binder_seq)} != binder_len {af_model._binder_len}; ignoring init_binder_seq")
+        else:
+            bias = af_model._inputs.get("bias")
+            if bias is None:
+                bias = np.zeros((1, af_model._len, 20), dtype=np.float32)
+            elif bias.ndim == 2:
+                bias = bias[None, ...]
+
+            # Mildly bias every binder position toward the provided initial AA
+            init_bias = float(kwargs.pop("init_binder_seq_bias", 5.0))
+            T = int(af_model._target_len)
+            for pos0, aa in enumerate(init_binder_seq):
+                aa_idx = binder_restype_order.get(aa)
+                if aa_idx is None:
+                    continue
+                bias[0, T + pos0, aa_idx] += init_bias
+
+            af_model._inputs["bias"] = bias
+
+    if init_binder_locked_map:
+        bias = af_model._inputs.get("bias")
+        if bias is None:
+            bias = np.zeros((1, af_model._len, 20), dtype=np.float32)
+        elif bias.ndim == 2:
+            bias = bias[None, ...]
+
+        T = int(af_model._target_len)
+        for p1_str, aa in dict(init_binder_locked_map).items():
+            try:
+                p1 = int(p1_str)
+            except Exception:
+                continue
+            if p1 <= 0:
+                continue
+            pos0 = p1 - 1
+            if not (0 <= pos0 < int(af_model._binder_len or 0)):
+                continue
+            aa = str(aa).strip().upper()
+            aa_idx = binder_restype_order.get(aa)
+            if aa_idx is None:
+                continue
+            global_pos = T + pos0
+            bias[0, global_pos, :] = -1e3
+            bias[0, global_pos, aa_idx] = 1e3
+
+        af_model._inputs["bias"] = bias
+        print(f"🔒 Binder injected/locked residues applied: {len(init_binder_locked_map)}")
 
     # === Lock binder sequence-fixed positions ===
     # Apply strong bias to binder positions that should keep their sequence

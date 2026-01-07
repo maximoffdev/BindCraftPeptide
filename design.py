@@ -40,6 +40,17 @@ def main():
     settings_path, filters_path, advanced_path, prefilters_path = perform_input_check(args)
     target_settings, advanced_settings, filters, prefilters = load_json_settings(settings_path, filters_path, advanced_path, prefilters_path)
 
+    # Preserve unshifted base specs for binder_advanced so runtime shifting doesn't compound across trajectories.
+    # Prefer specs provided in settings.json; fall back to advanced.json for backward compatibility.
+    if target_settings.get("protocol", "binder") == "binder_advanced":
+        for key in ("fixed_positions", "template_positions", "sequence_positions"):
+            base_key = f"{key}_base"
+            # Always prefer the value from settings.json when present; else fall back to advanced.json
+            base_val = target_settings.get(key, advanced_settings.get(key))
+            advanced_settings[base_key] = base_val
+        # Prefer disulfide_num from settings.json; fallback to advanced.json, default 1
+        advanced_settings["disulfide_num"] = int(target_settings.get("disulfide_num", advanced_settings.get("disulfide_num", 1)))
+
     settings_file = os.path.basename(settings_path).split(".")[0]
     filters_file = os.path.basename(filters_path).split(".")[0]
     advanced_file = os.path.basename(advanced_path).split(".")[0]
@@ -66,7 +77,7 @@ def main():
 
     pr.init(f'-ignore_unrecognized_res -ignore_zero_occupancy -mute all -holes:dalphaball {advanced_settings["dalphaball_path"]} -corrections::beta_nov16 true -relax:default_repeats 1')
     print(f"Running binder design for target {settings_file}")
-    print(f"Design settings used: {advanced_file}")
+    print(f"Design settings used: {settings_file}")
     # print(f"Filtering designs based on {filters_file}")
     # if prefilters_file is not None and advanced_settings.get("pre_filter_trajectory", False):
     #     print(f"Pre-filtering trajectories based on {prefilters_file}")
@@ -103,8 +114,124 @@ def main():
         trajectory_start_time = time.time()
         seed = int(np.random.randint(0, high=999999, size=1, dtype=int)[0])
 
+        def _parse_position_spec_to_1based_set(spec):
+            """Parse binder-local position specs into a set of 1-based integers.
+
+            Supports:
+            - None / "" -> empty
+            - int -> {int}
+            - list/tuple/set of ints/strings
+            - strings like "1,8,13" or "1-3,10" or "B12,B13" (chain prefix stripped)
+
+            Notes:
+            - Negative 1-based values are accepted (e.g., -1) but are NOT expanded without length.
+            """
+            if spec is None:
+                return set()
+
+            tokens = []
+            if isinstance(spec, (list, tuple, set)):
+                for item in spec:
+                    if item is None:
+                        continue
+                    tokens.append(str(item))
+            else:
+                tokens.append(str(spec))
+
+            out = set()
+            for raw in tokens:
+                s = raw.strip()
+                if not s:
+                    continue
+                for part in s.replace(" ", "").split(","):
+                    if not part:
+                        continue
+                    # strip an optional leading chain letter, e.g. "B12" -> "12"
+                    if len(part) >= 2 and part[0].isalpha() and (part[1].isdigit() or part[1] == '-'):
+                        part = part[1:]
+
+                    if "-" in part[1:]:
+                        # range; keep sign on the first number
+                        a_str, b_str = part.split("-", 1)
+                        try:
+                            a = int(a_str)
+                            b = int(b_str)
+                        except ValueError:
+                            continue
+                        step = 1 if b >= a else -1
+                        for v in range(a, b + step, step):
+                            out.add(v)
+                    else:
+                        try:
+                            out.add(int(part))
+                        except ValueError:
+                            continue
+            return out
+
+        def _required_min_len_from_specs_1based(pos_set_1based):
+            """Infer a minimum binder length from 1-based position specs.
+
+            Positive positions require length >= max(pos).
+            Negative positions (Python-style from end) require length >= abs(neg).
+            """
+            if not pos_set_1based:
+                return 0
+            req = 0
+            for p in pos_set_1based:
+                if p > 0:
+                    req = max(req, p)
+                elif p < 0:
+                    req = max(req, abs(p))
+            return req
+
+        def _required_min_len_from_disulfide_pairs(ds_pairs_spec):
+            """Infer a minimum binder length from 0-based disulfide pair indices.
+
+            Positive idx requires length >= idx+1.
+            Negative idx (Python-style from end) requires length >= abs(idx).
+            """
+            if not ds_pairs_spec:
+                return 0
+            req = 0
+            for (i, j) in ds_pairs_spec:
+                for idx in (i, j):
+                    if idx is None:
+                        continue
+                    try:
+                        idx_int = int(idx)
+                    except Exception:
+                        continue
+                    if idx_int >= 0:
+                        req = max(req, idx_int + 1)
+                    else:
+                        req = max(req, abs(idx_int))
+            return req
+
         if target_settings.get("protocol", "binder") == "binder_advanced":
-            length = get_chain_length(target_settings["starting_pdb"], "B")
+            # Reset to base specs each trajectory before shifting/runtime edits
+            advanced_settings["fixed_positions"] = advanced_settings.get("fixed_positions_base")
+            advanced_settings["template_positions"] = advanced_settings.get("template_positions_base")
+            advanced_settings["sequence_positions"] = advanced_settings.get("sequence_positions_base")
+
+            if "lengths" in target_settings and target_settings["lengths"]:
+                min_length = min(target_settings["lengths"])
+                max_length = max(target_settings["lengths"]) if max(target_settings["lengths"]) > min_length else min_length
+                samples = np.arange(min_length, max_length + 1)
+                length = int(np.random.choice(samples))
+            else:
+                # Fallback to the starting binder chain length if no sampling range was provided
+                length = get_chain_length(target_settings["starting_pdb"], "B")
+
+            fixed_pos_1b = _parse_position_spec_to_1based_set(advanced_settings.get("fixed_positions_base"))
+            template_pos_1b = _parse_position_spec_to_1based_set(advanced_settings.get("template_positions_base"))
+            sequence_pos_1b = _parse_position_spec_to_1based_set(advanced_settings.get("sequence_positions_base"))
+            required_min_length = max(
+                _required_min_len_from_specs_1based(fixed_pos_1b | template_pos_1b | sequence_pos_1b),
+                _required_min_len_from_disulfide_pairs(advanced_settings.get("disulfide_pairs")),
+            )
+
+            if length < required_min_length:
+                length = int(required_min_length)
         elif target_settings.get("protocol", "binder") == "binder":
             min_length = min(target_settings["lengths"])
             max_length = max(target_settings["lengths"]) if max(target_settings["lengths"]) > min_length else min_length
@@ -114,26 +241,142 @@ def main():
             print(f"Invalid protocol specified in settings.json, {target_settings.get('protocol', 'None')}, exiting...")
             sys.exit(1)
 
+        advanced_settings["binder_len_runtime"] = int(length)
+
         ds_pairs = []
-        ds_pairs_pre = advanced_settings.get("disulfide_pairs")
+        # Prefer disulfide specs from settings.json; fall back to advanced.json for compatibility
+        ds_pairs_pre = target_settings.get("disulfide_pairs", advanced_settings.get("disulfide_pairs"))
         if ds_pairs_pre:
             valid = True
             seen = set()
-            for (i, j) in ds_pairs_pre:
-                if j == -1:
-                    j = length - 1
-                if i == j or i < 0 or j < 0 or i >= length or j >= length:
-                    valid = False; break
-                if abs(i - j) < advanced_settings.get("disulfide_min_sep", 5):
-                    valid = False; break
-                if i in seen or j in seen:
-                    valid = False; break
-                seen.add(i); seen.add(j)
-                ds_pairs.append((i, j))
+            min_sep = int(advanced_settings.get("disulfide_min_sep", 5))
+
+            def _norm_ds_idx(idx, L):
+                idx_int = int(idx)
+                if idx_int < 0:
+                    idx_int = L + idx_int
+                return idx_int
+
+            try:
+                for (i_raw, j_raw) in ds_pairs_pre:
+                    i = _norm_ds_idx(i_raw, length)
+                    j = _norm_ds_idx(j_raw, length)
+                    if i == j or i < 0 or j < 0 or i >= length or j >= length:
+                        valid = False
+                        break
+                    if abs(i - j) < min_sep:
+                        valid = False
+                        break
+                    if i in seen or j in seen:
+                        valid = False
+                        break
+                    seen.add(i)
+                    seen.add(j)
+                    ds_pairs.append((i, j))
+            except Exception:
+                valid = False
+
             if not valid:
                 ds_pairs = []
 
+        # Store normalized (0-based) disulfide indices for downstream use
+        advanced_settings["disulfide_pairs_runtime"] = ds_pairs
+
         helicity_value = load_helicity(advanced_settings)
+
+        # === binder_advanced: optional shifted motif + random initial binder sequence ===
+        if target_settings.get("protocol", "binder") == "binder_advanced":
+            binder_chain_id = target_settings.get("binder_chain", "B")
+
+            # Use starting binder sequence as the conserved pattern source (if present)
+            try:
+                _base_binder_seq = extract_chain_sequence_from_pdb(target_settings["starting_pdb"], binder_chain_id)
+            except Exception:
+                _base_binder_seq = ""
+
+            fixed_pos_1b = _parse_position_spec_to_1based_set(advanced_settings.get("fixed_positions_base"))
+            template_pos_1b = _parse_position_spec_to_1based_set(advanced_settings.get("template_positions_base"))
+            sequence_pos_1b = _parse_position_spec_to_1based_set(advanced_settings.get("sequence_positions_base"))
+
+            # Only shift positive 1-based positions (negative 1-based can't be shifted without a defined length mapping)
+
+            motif_pos_1b = sorted({p for p in (fixed_pos_1b | template_pos_1b | sequence_pos_1b) if p > 0})
+
+            offset = 0
+            if motif_pos_1b:
+                motif_pos_0b = [p - 1 for p in motif_pos_1b]
+                base_min = min(motif_pos_0b)
+                base_max = max(motif_pos_0b)
+                # Right-aligned random motif placement: last motif residue must be at or before last binder position
+                max_offset = (length - 1) - base_max
+                min_offset = -base_min
+                if max_offset >= min_offset:
+                    rng = np.random.default_rng(seed)
+                    offset = int(rng.integers(min_offset, max_offset + 1))
+            advanced_settings["positions_shift_offset_runtime"] = int(offset)
+
+            def _shift_1b_set(pos_set_1b, off, L):
+                out = set()
+                for p in pos_set_1b:
+                    if p <= 0:
+                        # Keep negative/zero values unchanged
+                        out.add(p)
+                        continue
+                    p0 = p - 1
+                    p0s = p0 + off
+                    if 0 <= p0s < L:
+                        out.add(p0s + 1)
+                return out
+
+            fixed_shift_1b = _shift_1b_set(fixed_pos_1b, offset, length)
+            template_shift_1b = _shift_1b_set(template_pos_1b, offset, length)
+            sequence_shift_1b = _shift_1b_set(sequence_pos_1b, offset, length)
+
+            # Write shifted runtime positions back to advanced_settings (comma-separated ints)
+            if fixed_shift_1b:
+                advanced_settings["fixed_positions"] = ",".join(str(x) for x in sorted(fixed_shift_1b) if x)
+                advanced_settings["fixed_positions_runtime"] = advanced_settings["fixed_positions"]
+            else:
+                advanced_settings["fixed_positions_runtime"] = ""
+
+            if template_shift_1b:
+                advanced_settings["template_positions"] = ",".join(str(x) for x in sorted(template_shift_1b) if x)
+                advanced_settings["template_positions_runtime"] = advanced_settings["template_positions"]
+            else:
+                advanced_settings["template_positions_runtime"] = ""
+
+            if sequence_shift_1b:
+                advanced_settings["sequence_positions"] = ",".join(str(x) for x in sorted(sequence_shift_1b) if x)
+                advanced_settings["sequence_positions_runtime"] = advanced_settings["sequence_positions"]
+            else:
+                advanced_settings["sequence_positions_runtime"] = ""
+
+            # Initialize a random binder sequence and inject conserved residues from the starting binder
+            allowed = [aa for aa in "ACDEFGHIKLMNPQRSTVWY" if aa not in set(str(advanced_settings.get("omit_AAs", "")).replace(" ", "").split(","))]
+            if not allowed:
+                allowed = list("ACDEFGHIKLMNPQRSTVWY")
+            rng = np.random.default_rng(seed)
+            init_seq_list = [str(rng.choice(allowed)) for _ in range(length)]
+
+            # Inject conserved residues at shifted motif positions (union of fixed/template/sequence)
+            injected_map = {}
+            motif_shift_union_1b = sorted({p for p in (fixed_shift_1b | template_shift_1b | sequence_shift_1b) if p > 0})
+            for p1 in motif_shift_union_1b:
+                src_p0 = (p1 - 1) - offset
+                if 0 <= src_p0 < len(_base_binder_seq):
+                    aa = _base_binder_seq[src_p0]
+                    init_seq_list[p1 - 1] = aa
+                    injected_map[int(p1)] = aa
+
+            # Inject disulfide cysteines AFTER length is finalized (ds_pairs are 0-based runtime indices)
+            for (i, j) in ds_pairs:
+                for idx0 in (i, j):
+                    if 0 <= idx0 < length:
+                        init_seq_list[idx0] = "C"
+                        injected_map[int(idx0 + 1)] = "C"
+
+            advanced_settings["init_binder_seq_runtime"] = "".join(init_seq_list)
+            advanced_settings["init_binder_locked_map_runtime"] = injected_map
         design_name = f"{target_settings['binder_name']}_l{length}_s{seed}"
         trajectory_dirs = ["Trajectory", "Trajectory/Relaxed", "Trajectory/LowConfidence", "Trajectory/Clashing"]
         trajectory_exists = any(os.path.exists(os.path.join(design_paths[td], design_name + ".pdb")) for td in trajectory_dirs)
