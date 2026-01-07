@@ -27,7 +27,7 @@
     "_comment_fixed_positions": "Comma-separated positions (1-based) to lock sequence AND structure (e.g., '1-3,10'). Use for catalytic sites or critical residues. Independent of floating setting.",
     "template_positions": "",
     "_comment_template_positions": "Comma-separated positions (1-based) to lock structure but redesign sequence (e.g., '15-20'). Use to preserve secondary structure geometry. Independent of floating setting.",
-    "sequence_positions": "1,13",
+    "sequence_positions": "1,8,13",
     "_extended_sequence_positions": "",
     "_comment_sequence_positions": "Comma-separated positions (1-based) to lock sequence but allow movement (e.g., '5-8'). Use for binding motifs that need spatial optimization. Independent of floating setting.",
     "_comment_position_hierarchy": "Position priority: fixed_positions (seq+struct) > template_positions (struct only) > sequence_positions (seq only) > redesign (full freedom). Each position belongs to exactly one category. Disulfide pairs are automatically added to fixed_positions (if floating=false) or sequence_positions (if floating=true).",

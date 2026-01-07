@@ -195,13 +195,44 @@ def main():
                                trajectory_time_text, traj_seq_notes, settings_file, filters_file, advanced_file]
             insert_data(trajectory_csv, trajectory_data)
 
+            print(advanced_settings.get("fixed_positions", None))
+            print(advanced_settings.get("sequence_positions", None))
+            print(trajectory_interface_residues)
+            print(ds_pairs)
+
+            # Build fixed MPNN scaffold positions in the same "B{resnum}" format as trajectory_interface_residues
+            def _parse_pos_list(v):
+                if v is None:
+                    return set()
+                if isinstance(v, (list, tuple, set)):
+                    return {int(x) for x in v}
+                if isinstance(v, str):
+                    v = v.strip()
+                    if not v:
+                        return set()
+                    return {int(x) for x in v.replace(" ", "").split(",") if x}
+                return {int(v)}
+
+            fixed_positions_set = _parse_pos_list(advanced_settings.get("fixed_positions"))
+            sequence_positions_set = _parse_pos_list(advanced_settings.get("sequence_positions"))
+            ds_positions_set = {idx + 1 for (i, j) in ds_pairs for idx in (i, j)}  # ds_pairs are 0-based -> convert to 1-based
+
+            fixed_mpnn_scaffold = {
+                f"{binder_chain}{pos}"
+                for pos in (fixed_positions_set | sequence_positions_set | ds_positions_set)
+            }
+
+            print(fixed_mpnn_scaffold)
+
             if not trajectory_interface_residues:
                 print(f"No interface residues found for {design_name}, skipping MPNN optimization")
+
             elif advanced_settings["enable_mpnn"]:
                 mpnn_n = 1
                 accepted_mpnn = 0
                 design_start_time = time.time()
-                mpnn_trajectories = mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residues, advanced_settings)
+
+                mpnn_trajectories = mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residues, fixed_mpnn_scaffold, advanced_settings)
 
                 # Save complete (target+binder) sequences for all sampled MPNN outputs
                 mpnn_complete_dir = os.path.join(target_settings["design_path"], "trajectory_fastas")

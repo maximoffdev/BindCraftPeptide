@@ -1,3 +1,13 @@
+Make settings more user friendly
+
+variable length for scaffolding
+
+fix mpnn residues for scaffolding
+
+number disulfides = explicit disulfides + random disulfides
+
+
+
 Adjustable plddt and iptm filters during AF2 design protocol --> done
 
 
