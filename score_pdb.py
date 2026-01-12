@@ -14,6 +14,7 @@ import sys
 import argparse
 import time
 import re
+import csv
 from collections import defaultdict
 from pathlib import Path
 import pyrosetta as pr
@@ -87,6 +88,70 @@ def collect_pdbs(scan_root: Path):
     return pdbs
 
 
+def _safe_float(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+_BOLTZ_MODEL_SUFFIX_RE = re.compile(r"^(?P<base>.+)_model(?P<model>\d+)$")
+
+
+def load_boltz_repredict_stats(design_path: Path):
+    """Load boltz_repredict_stats.csv if present.
+
+    Returns a mapping keyed by (design_base_name, model_num_or_None) -> stats dict.
+    If the CSV's design_name includes a *_modelN suffix, it is parsed and stored under that model.
+    Otherwise it is stored under model None.
+    """
+    boltz_csv = design_path / "boltz_repredict_stats.csv"
+    if not boltz_csv.exists():
+        return {}
+
+    by_design_model = {}
+    with boltz_csv.open("r", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            raw_name = (row.get("design_name") or "").strip()
+            if not raw_name:
+                continue
+
+            match = _BOLTZ_MODEL_SUFFIX_RE.match(raw_name)
+            if match:
+                design_base = match.group("base")
+                model_num = int(match.group("model"))
+            else:
+                design_base = raw_name
+                model_num = None
+
+            stats = {k: _safe_float(v) if k != "design_name" else raw_name for k, v in row.items()}
+
+            # Map boltz naming onto BindCraft's expected complex keys where possible
+            mapped = {
+                "pTM": stats.get("pTM_complex"),
+                "i_pTM": stats.get("ipTM_complex"),
+                "pLDDT": stats.get("pLDDT_complex"),
+                "i_pLDDT": stats.get("ipLDDT_complex"),
+                "pAE": stats.get("pDE_complex"),
+                "i_pAE": stats.get("ipDE_complex"),
+            }
+            for k, v in mapped.items():
+                if v is not None:
+                    stats[k] = v
+
+            by_design_model[(design_base, model_num)] = stats
+
+    return by_design_model
+
+
 def main():
     parser = argparse.ArgumentParser(description="Score existing PDBs without AF2 reprediction")
     parser.add_argument("--settings", "-s", required=True, help="Path to basic settings.json")
@@ -140,6 +205,11 @@ def main():
     helicity_value = load_helicity(advanced_settings)
     seed = 0
     design_path = Path(target_settings["design_path"])
+    boltz_stats_by_design_model = load_boltz_repredict_stats(design_path)
+    if boltz_stats_by_design_model:
+        print(f"Loaded boltz repredict stats from {design_path / 'boltz_repredict_stats.csv'}")
+    else:
+        print("No boltz_repredict_stats.csv found; continuing without boltz metrics")
 
     for design_name in sorted(grouped.keys()):
         model_map = grouped[design_name]
@@ -182,6 +252,7 @@ def main():
                     interface_residues_for_row = interface_residues
 
                 complex_statistics[model_num] = {
+                    # Optional: boltz AF metrics (merged below if available)
                     'i_pLDDT': i_plddt,
                     'ss_pLDDT': ss_plddt,
                     'Unrelaxed_Clashes': num_clashes,
@@ -210,6 +281,13 @@ def main():
                     'Hotspot_RMSD': hotspot_rmsd,
                     'Target_RMSD': target_rmsd,
                 }
+
+                boltz_stats = (
+                    boltz_stats_by_design_model.get((design_name, model_num))
+                    or boltz_stats_by_design_model.get((design_name, None))
+                )
+                if boltz_stats:
+                    complex_statistics[model_num].update(boltz_stats)
             except Exception as exc:
                 print(f"Skipping {design_name} model {model_num}: {exc}")
                 continue

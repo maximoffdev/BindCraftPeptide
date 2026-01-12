@@ -51,6 +51,10 @@ def main():
         # Prefer disulfide_num from settings.json; fallback to advanced.json, default 1
         advanced_settings["disulfide_num"] = int(target_settings.get("disulfide_num", advanced_settings.get("disulfide_num", 1)))
 
+    # if target settings contains max_trajectories, override advanced setting
+    if "max_trajectories" in target_settings:
+        advanced_settings["max_trajectories"] = int(target_settings["max_trajectories"])
+
     settings_file = os.path.basename(settings_path).split(".")[0]
     filters_file = os.path.basename(filters_path).split(".")[0]
     advanced_file = os.path.basename(advanced_path).split(".")[0]
