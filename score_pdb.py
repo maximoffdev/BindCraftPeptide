@@ -5,6 +5,8 @@ Scans a directory of PDBs (by default Repredicted/Relaxed), groups files by desi
 using the common *_modelN.pdb naming, computes interface/secondary-structure metrics,
 and writes repredict_stats.csv.
 
+Optionally, PDBs can be relaxed with PyRosetta before scoring (see --relax).
+
 Hotspot RMSD is computed by comparing each scored model PDB to its corresponding
 trajectory PDB in Trajectory/. For MPNN designs, the mapping strips the *_mpnnX
 suffix to find the base trajectory name.
@@ -41,6 +43,20 @@ def extract_chain_sequence(pdb_path, chain_id):
         resname = res.get_resname()
         seq.append(three_to_one.get(resname, 'X'))
     return ''.join(seq)
+
+
+def infer_single_disulfide_pair_from_binder_sequence(binder_seq: str):
+    """Infer a single disulfide pair from binder sequence.
+
+    Assumption (per workflow simplification): exactly two cysteines exist in every binder
+    and they should be stapled together.
+
+    Returns a list of one tuple with 0-based binder-local indices, or None if not possible.
+    """
+    cys_positions = [i for i, aa in enumerate(binder_seq) if aa == "C"]
+    if len(cys_positions) != 2:
+        return None
+    return [(cys_positions[0], cys_positions[1])]
 
 
 _MODEL_RE = re.compile(r"^(?P<base>.+)_model(?P<model>\d+)$")
@@ -82,7 +98,11 @@ def collect_pdbs(scan_root: Path):
 
     relaxed = [p for p in pdbs if "Relaxed" in p.parts]
     if relaxed:
-        pdbs = relaxed
+        # Prefer Relaxed PDBs, but keep unrelaxed ones that don't have a relaxed counterpart.
+        relaxed_by_name = {p.name: p for p in relaxed}
+        unrelaxed = [p for p in pdbs if "Relaxed" not in p.parts]
+        unrelaxed_without_relaxed_copy = [p for p in unrelaxed if p.name not in relaxed_by_name]
+        pdbs = list(relaxed) + unrelaxed_without_relaxed_copy
 
     pdbs = [p for p in pdbs if "Binder" not in p.parts and "Best" not in p.parts]
     return pdbs
@@ -159,6 +179,8 @@ def main():
     parser.add_argument("--advanced", "-a", default="./settings_advanced/default_4stage_multimer.json", help="Path to advanced settings json")
     parser.add_argument("--prefilters", "-p", default=None, help="Unused placeholder for compatibility")
     parser.add_argument("--input-pdbs", default=None, help="Optional directory to scan for PDBs; defaults to design_path/Repredicted")
+    parser.add_argument("--relax", action="store_true", help="Relax complex PDBs into Relaxed/ before scoring")
+    parser.add_argument("--use_disulfide", action="store_true", help="Enable disulfide mode during relaxation")
     args = parser.parse_args()
 
     settings_path, filters_path, advanced_path, prefilters_path = perform_input_check(args)
@@ -184,6 +206,70 @@ def main():
     create_dataframe(repredict_csv, design_labels)
 
     scan_root = Path(args.input_pdbs) if args.input_pdbs else Path(target_settings["design_path"]) / "Repredicted"
+    relaxed_dir = None
+
+    # Optional relaxation step: relax all non-relaxed complex PDBs into Relaxed/ and then score relaxed.
+    if args.relax:
+        relaxed_dir = scan_root / "Relaxed"
+        relaxed_dir.mkdir(parents=True, exist_ok=True)
+
+        # Only relax complex PDBs (exclude Binder/Best and anything already under Relaxed)
+        unrelaxed_pdbs = [
+            p for p in sorted(scan_root.rglob("*.pdb"))
+            if "Relaxed" not in p.parts and "Binder" not in p.parts and "Best" not in p.parts
+        ]
+        print(f"Found {len(unrelaxed_pdbs)} unrelaxed complex PDB(s) under {scan_root} to relax")
+
+        # Determine whether disulfides should be applied during relaxation.
+        # CLI has highest priority; then target_settings (if set) overrides advanced_settings.
+        disulfide_enabled = bool(
+            args.use_disulfide
+            or target_settings.get(
+                "use_disulfide_loss",
+                advanced_settings.get("use_disulfide_loss", False),
+            )
+        )
+
+        for unrelaxed_pdb in unrelaxed_pdbs:
+            design_base, model_num = parse_design_and_model(unrelaxed_pdb)
+            if model_num < 1 or model_num > 5:
+                continue
+            out_relaxed = relaxed_dir / f"{design_base}_model{model_num}.pdb"
+            if out_relaxed.exists():
+                continue
+            print(f"Relaxing {unrelaxed_pdb.name} -> {out_relaxed.name}")
+
+            pairs = None
+            disulfide_for_this = False
+            if disulfide_enabled:
+                try:
+                    binder_seq = extract_chain_sequence(str(unrelaxed_pdb), binder_chain)
+                    pairs = infer_single_disulfide_pair_from_binder_sequence(binder_seq)
+                    if pairs is None:
+                        cys_count = binder_seq.count("C")
+                        raise ValueError(
+                            f"binder sequence has {cys_count} cysteines (expected exactly 2)"
+                        )
+                    disulfide_for_this = True
+                except Exception as exc:
+                    print(
+                        f"Warning: skipping relaxation for {unrelaxed_pdb.name} due to disulfide inference error: {exc}"
+                    )
+                    continue
+
+            try:
+                pr_relax(
+                    str(unrelaxed_pdb),
+                    str(out_relaxed),
+                    disulfide=disulfide_for_this,
+                    binder_chain=binder_chain,
+                    binder_local_pairs=pairs,
+                )
+            except Exception as exc:
+                print(f"Warning: skipping relaxation for {unrelaxed_pdb.name} due to relax error: {exc}")
+                continue
+
+    # Collect PDBs to score: prefer Relaxed/ if present (or if relax was enabled)
     pdb_paths = collect_pdbs(scan_root)
     print(f"Found {len(pdb_paths)} PDBs under {scan_root}")
     if not pdb_paths:
@@ -238,7 +324,23 @@ def main():
         for model_num in model_nums:
             pdb_path = model_map[model_num]
             try:
-                num_clashes = calculate_clash_score(str(pdb_path))
+                # If relaxation is enabled we want both unrelaxed + relaxed clash counts.
+                # pdb_path will usually point at the relaxed structure due to collect_pdbs() preference.
+                num_clashes_unrelaxed = None
+                num_clashes_relaxed = None
+
+                if args.relax:
+                    # Derive the corresponding unrelaxed file path (same basename, outside Relaxed/).
+                    if "Relaxed" in pdb_path.parts:
+                        rel_idx = pdb_path.parts.index("Relaxed")
+                        unrelaxed_candidate = Path(*pdb_path.parts[:rel_idx]) / pdb_path.name
+                    else:
+                        unrelaxed_candidate = pdb_path
+
+                    num_clashes_unrelaxed = calculate_clash_score(str(unrelaxed_candidate)) if unrelaxed_candidate.exists() else None
+                    num_clashes_relaxed = calculate_clash_score(str(pdb_path))
+                else:
+                    num_clashes_relaxed = calculate_clash_score(str(pdb_path))
                 interface_scores, interface_AA, interface_residues = score_interface(str(pdb_path), binder_chain)
                 alpha, beta, loops, alpha_interface, beta_interface, loops_interface, i_plddt, ss_plddt = calc_ss_percentage(str(pdb_path), advanced_settings, binder_chain)
                 target_rmsd = target_pdb_rmsd(str(pdb_path), target_settings["starting_pdb"], target_settings["chains"])
@@ -255,8 +357,8 @@ def main():
                     # Optional: boltz AF metrics (merged below if available)
                     'i_pLDDT': i_plddt,
                     'ss_pLDDT': ss_plddt,
-                    'Unrelaxed_Clashes': num_clashes,
-                    'Relaxed_Clashes': num_clashes,
+                    'Unrelaxed_Clashes': num_clashes_unrelaxed if args.relax else num_clashes_relaxed,
+                    'Relaxed_Clashes': num_clashes_relaxed,
                     'Binder_Energy_Score': interface_scores['binder_score'],
                     'Surface_Hydrophobicity': interface_scores['surface_hydrophobicity'],
                     'ShapeComplementarity': interface_scores['interface_sc'],
