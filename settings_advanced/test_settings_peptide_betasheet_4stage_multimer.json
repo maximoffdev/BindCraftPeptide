@@ -32,6 +32,8 @@
     "_comment_sequence_positions": "Comma-separated positions (1-based) to lock sequence but allow movement (e.g., '5-8'). Use for binding motifs that need spatial optimization. Independent of floating setting.",
     "_comment_position_hierarchy": "Position priority: fixed_positions (seq+struct) > template_positions (struct only) > sequence_positions (seq only) > redesign (full freedom). Each position belongs to exactly one category. Disulfide pairs are automatically added to fixed_positions (if floating=false) or sequence_positions (if floating=true).",
     "_comment_examples": "EXAMPLES: (1) Lock helix, redesign rest: template_positions='10-25', floating=false. (2) Keep binding motif, optimize structure: sequence_positions='15-17', floating=true. (3) Anchor CYS pair, flexible rest: fixed_positions='1,14', floating unset (or set disulfide_pairs and floating=false). (4) Mobile disulfide: set disulfide_pairs, floating=true.",
+    "weights_template_ca_rmsd": 0.1,
+    "_comment_weights_template_ca_rmsd": "Weight for template C-alpha RMSD loss for the shift motif position case for scaffolding",
 
     "_comment_section_2": "=== AlphaFold Model Settings ===",
     "use_multimer_design": true,

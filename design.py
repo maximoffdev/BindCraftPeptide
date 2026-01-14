@@ -50,6 +50,27 @@ def main():
             advanced_settings[base_key] = base_val
         # Prefer disulfide_num from settings.json; fallback to advanced.json, default 1
         advanced_settings["disulfide_num"] = int(target_settings.get("disulfide_num", advanced_settings.get("disulfide_num", 1)))
+        # Allow hallucination to optionally use the binder chain in the input PDB as a structural template.
+        advanced_settings["use_template_binder"] = bool(
+            target_settings.get("use_template_binder", advanced_settings.get("use_template_binder", False))
+        )
+        # Debug flag for position/motif/template diagnostics
+        advanced_settings["debug_positions"] = bool(
+            target_settings.get("debug_positions", advanced_settings.get("debug_positions", False))
+        )
+
+        # Optional: explicit structural fixation weight (CA-to-template restraint)
+        # Allow setting from settings.json so users don't need to modify advanced.json.
+        if "weights_template_ca" in target_settings:
+            try:
+                advanced_settings["weights_template_ca"] = float(target_settings["weights_template_ca"])
+            except Exception:
+                pass
+        if "weights_template_ca_rmsd" in target_settings:
+            try:
+                advanced_settings["weights_template_ca_rmsd"] = float(target_settings["weights_template_ca_rmsd"])
+            except Exception:
+                pass
 
     # if target settings contains max_trajectories, override advanced setting
     if "max_trajectories" in target_settings:
@@ -211,6 +232,46 @@ def main():
                         req = max(req, abs(idx_int))
             return req
 
+        def _normalize_disulfide_pairs_spec(spec):
+            """Normalize disulfide_pairs to a list of (i, j) pairs (0-based, binder-local).
+
+            Accepts:
+            - [[0, -1]] / [(0, -1)]  -> one pair
+            - [0, -1]                -> one pair
+            - [0, -1, 3, 7]          -> paired sequentially
+            """
+            if spec is None:
+                return []
+
+            if isinstance(spec, (list, tuple)) and len(spec) == 0:
+                return []
+
+            # Single pair like [0, -1]
+            if (
+                isinstance(spec, (list, tuple))
+                and len(spec) == 2
+                and not any(isinstance(x, (list, tuple)) for x in spec)
+            ):
+                return [(spec[0], spec[1])]
+
+            # List of pairs
+            if (
+                isinstance(spec, (list, tuple))
+                and all(isinstance(x, (list, tuple)) and len(x) == 2 for x in spec)
+            ):
+                return [(x[0], x[1]) for x in spec]
+
+            # Flat list -> pair it
+            if isinstance(spec, (list, tuple)) and all(not isinstance(x, (list, tuple)) for x in spec):
+                if len(spec) % 2 != 0:
+                    return []
+                out = []
+                for k in range(0, len(spec), 2):
+                    out.append((spec[k], spec[k + 1]))
+                return out
+
+            return []
+
         if target_settings.get("protocol", "binder") == "binder_advanced":
             # Reset to base specs each trajectory before shifting/runtime edits
             advanced_settings["fixed_positions"] = advanced_settings.get("fixed_positions_base")
@@ -226,12 +287,34 @@ def main():
                 # Fallback to the starting binder chain length if no sampling range was provided
                 length = get_chain_length(target_settings["starting_pdb"], "B")
 
+            # If we are using a template binder scaffold, do not crop it; instead ensure binder_len
+            # is at least the scaffold chain length.
+            if bool(advanced_settings.get("use_template_binder", False)):
+                binder_chain_id = target_settings.get("binder_chain", "B")
+                try:
+                    scaffold_len = int(get_chain_length(target_settings["starting_pdb"], binder_chain_id))
+                except Exception:
+                    scaffold_len = 0
+                if scaffold_len and length < scaffold_len:
+                    if advanced_settings.get("debug_positions", False):
+                        print(
+                            "[DEBUG positions] sampled length",
+                            int(length),
+                            "< scaffold_len",
+                            int(scaffold_len),
+                            "-> using scaffold_len",
+                        )
+                    length = int(scaffold_len)
+
             fixed_pos_1b = _parse_position_spec_to_1based_set(advanced_settings.get("fixed_positions_base"))
             template_pos_1b = _parse_position_spec_to_1based_set(advanced_settings.get("template_positions_base"))
             sequence_pos_1b = _parse_position_spec_to_1based_set(advanced_settings.get("sequence_positions_base"))
+
+            ds_pairs_spec_raw = target_settings.get("disulfide_pairs", advanced_settings.get("disulfide_pairs"))
+            ds_pairs_spec_norm = _normalize_disulfide_pairs_spec(ds_pairs_spec_raw)
             required_min_length = max(
                 _required_min_len_from_specs_1based(fixed_pos_1b | template_pos_1b | sequence_pos_1b),
-                _required_min_len_from_disulfide_pairs(advanced_settings.get("disulfide_pairs")),
+                _required_min_len_from_disulfide_pairs(ds_pairs_spec_norm),
             )
 
             if length < required_min_length:
@@ -249,7 +332,10 @@ def main():
 
         ds_pairs = []
         # Prefer disulfide specs from settings.json; fall back to advanced.json for compatibility
-        ds_pairs_pre = target_settings.get("disulfide_pairs", advanced_settings.get("disulfide_pairs"))
+        ds_pairs_pre_raw = target_settings.get("disulfide_pairs", advanced_settings.get("disulfide_pairs"))
+        ds_pairs_pre = _normalize_disulfide_pairs_spec(ds_pairs_pre_raw)
+        if ds_pairs_pre_raw and not ds_pairs_pre:
+            print(f"Warning: invalid disulfide_pairs format in settings; ignoring: {ds_pairs_pre_raw}")
         if ds_pairs_pre:
             valid = True
             seen = set()
@@ -307,7 +393,24 @@ def main():
             motif_pos_1b = sorted({p for p in (fixed_pos_1b | template_pos_1b | sequence_pos_1b) if p > 0})
 
             offset = 0
-            if motif_pos_1b:
+            # Default behavior: do NOT shift motif positions (keeps positions aligned to the template indexing).
+            # Enable explicitly via settings.json: "shift_motif_positions": true
+            shift_enabled = bool(
+                target_settings.get(
+                    "shift_motif_positions",
+                    advanced_settings.get("shift_motif_positions", False),
+                )
+            )
+
+            if advanced_settings.get("debug_positions", False):
+                print("[DEBUG positions] use_template_binder:", bool(advanced_settings.get("use_template_binder", False)))
+                print("[DEBUG positions] shift_motif_positions:", shift_enabled)
+                print("[DEBUG positions] base fixed_positions:", advanced_settings.get("fixed_positions_base"))
+                print("[DEBUG positions] base template_positions:", advanced_settings.get("template_positions_base"))
+                print("[DEBUG positions] base sequence_positions:", advanced_settings.get("sequence_positions_base"))
+                print("[DEBUG positions] base motif_pos_1b:", motif_pos_1b)
+
+            if shift_enabled and motif_pos_1b:
                 motif_pos_0b = [p - 1 for p in motif_pos_1b]
                 base_min = min(motif_pos_0b)
                 base_max = max(motif_pos_0b)
@@ -318,6 +421,10 @@ def main():
                     rng = np.random.default_rng(seed)
                     offset = int(rng.integers(min_offset, max_offset + 1))
             advanced_settings["positions_shift_offset_runtime"] = int(offset)
+
+            if advanced_settings.get("debug_positions", False):
+                print("[DEBUG positions] binder_len_runtime:", int(length))
+                print("[DEBUG positions] positions_shift_offset_runtime:", int(offset))
 
             def _shift_1b_set(pos_set_1b, off, L):
                 out = set()
@@ -335,6 +442,23 @@ def main():
             fixed_shift_1b = _shift_1b_set(fixed_pos_1b, offset, length)
             template_shift_1b = _shift_1b_set(template_pos_1b, offset, length)
             sequence_shift_1b = _shift_1b_set(sequence_pos_1b, offset, length)
+
+            # Map shifted binder positions back to ORIGINAL (unshifted) scaffold positions.
+            # Keys/values are binder-local 0-based indices: shifted0b -> base0b.
+            scaffold_pos_map = {}
+            base_struct_1b = sorted({p for p in (fixed_pos_1b | template_pos_1b) if p > 0})
+            for p1 in base_struct_1b:
+                base0 = int(p1) - 1
+                shifted0 = base0 + int(offset)
+                if 0 <= shifted0 < int(length):
+                    scaffold_pos_map[int(shifted0)] = int(base0)
+            advanced_settings["scaffold_pos_map_runtime"] = scaffold_pos_map
+
+            if advanced_settings.get("debug_positions", False):
+                print("[DEBUG positions] shifted fixed_positions_1b:", sorted([p for p in fixed_shift_1b if p > 0]))
+                print("[DEBUG positions] shifted template_positions_1b:", sorted([p for p in template_shift_1b if p > 0]))
+                print("[DEBUG positions] shifted sequence_positions_1b:", sorted([p for p in sequence_shift_1b if p > 0]))
+                print("[DEBUG positions] scaffold_pos_map_runtime (shifted0b->base0b):", scaffold_pos_map)
 
             # Write shifted runtime positions back to advanced_settings (comma-separated ints)
             if fixed_shift_1b:
@@ -381,6 +505,10 @@ def main():
 
             advanced_settings["init_binder_seq_runtime"] = "".join(init_seq_list)
             advanced_settings["init_binder_locked_map_runtime"] = injected_map
+
+            if advanced_settings.get("debug_positions", False):
+                print("[DEBUG positions] disulfide_pairs_runtime (0-based):", ds_pairs)
+                print("[DEBUG positions] init_binder_locked_map_runtime (1-based->AA):", injected_map)
         design_name = f"{target_settings['binder_name']}_l{length}_s{seed}"
         trajectory_dirs = ["Trajectory", "Trajectory/Relaxed", "Trajectory/LowConfidence", "Trajectory/Clashing"]
         trajectory_exists = any(os.path.exists(os.path.join(design_paths[td], design_name + ".pdb")) for td in trajectory_dirs)

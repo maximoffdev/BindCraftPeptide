@@ -29,6 +29,27 @@ settings_path, filters_path, advanced_path, prefilters_path = perform_input_chec
 ### load settings from JSON
 target_settings, advanced_settings, filters, prefilters = load_json_settings(settings_path, filters_path, advanced_path, prefilters_path)
 
+# Allow settings.json to enable template binder usage in hallucination (binder_advanced)
+if target_settings.get("protocol", "binder") == "binder_advanced":
+    advanced_settings["use_template_binder"] = bool(
+        target_settings.get("use_template_binder", advanced_settings.get("use_template_binder", False))
+    )
+    advanced_settings["debug_positions"] = bool(
+        target_settings.get("debug_positions", advanced_settings.get("debug_positions", False))
+    )
+
+    # Optional: explicit structural fixation weight (CA-to-template restraint)
+    if "weights_template_ca" in target_settings:
+        try:
+            advanced_settings["weights_template_ca"] = float(target_settings["weights_template_ca"])
+        except Exception:
+            pass
+    if "weights_template_ca_rmsd" in target_settings:
+        try:
+            advanced_settings["weights_template_ca_rmsd"] = float(target_settings["weights_template_ca_rmsd"])
+        except Exception:
+            pass
+
 settings_file = os.path.basename(settings_path).split('.')[0]
 filters_file = os.path.basename(filters_path).split('.')[0]
 advanced_file = os.path.basename(advanced_path).split('.')[0]
