@@ -7,8 +7,199 @@ import os
 import sys
 import argparse
 import time
+import copy
+import tempfile
+from Bio import PDB
 import numpy as np
 from functions import *
+
+
+def _parse_chain_ids(chain_spec: str):
+    if chain_spec is None:
+        return []
+    return [c.strip() for c in str(chain_spec).split(",") if c.strip()]
+
+
+def _shift_position_csv(pos_csv: str, offset: int, length: int) -> str:
+    """Shift a comma-separated list of 1-based positions by offset, keeping only 1..length."""
+    if pos_csv is None:
+        return ""
+    s = str(pos_csv).strip()
+    if not s:
+        return ""
+    out = []
+    for tok in s.replace(" ", "").split(","):
+        if not tok:
+            continue
+        try:
+            p = int(tok)
+        except ValueError:
+            continue
+        if p <= 0:
+            continue
+        ps = p + int(offset)
+        if 1 <= ps <= int(length):
+            out.append(ps)
+    out = sorted(set(out))
+    return ",".join(str(x) for x in out)
+
+
+def make_temp_pdb_with_shifted_scaffold(
+    *,
+    starting_pdb: str,
+    target_chains: str,
+    binder_chain: str,
+    binder_len: int,
+    scaffold_indices_1b,
+    base_positions_min_1b: int,
+    ds_pairs_0b=None,
+    seed: int,
+    out_dir: str,
+    debug: bool = False,
+):
+    """Create a temporary PDB with a binder chain of length binder_len.
+
+    - The binder is initialized as GLY residues with random-ish backbone coordinates.
+    - Scaffold residues are copied (all atoms) from the original binder chain at indices in scaffold_indices_1b
+      and inserted into the new binder by applying a constant integer shift.
+
+    Offset logic (per your spec):
+      sample u ~ Uniform{1, ..., binder_len - len(scaffold_indices) - 1}
+      offset = (u + 1) - base_positions_min_1b
+    The +1 keeps 1-based residue indices valid.
+
+    Returns (temp_pdb_path, offset).
+    """
+    scaffold = sorted({int(x) for x in (scaffold_indices_1b or []) if int(x) > 0})
+    if len(scaffold) == 0:
+        raise ValueError("scaffold_indices_1b is empty")
+    if int(binder_len) <= 0:
+        raise ValueError("binder_len must be > 0")
+    if int(binder_len) < len(scaffold):
+        raise ValueError(
+            f"binder_len ({binder_len}) < len(scaffold_indices) ({len(scaffold)})"
+        )
+
+    rng = np.random.default_rng(int(seed))
+    u_max = int(binder_len) - int(len(scaffold))    
+    u = int(rng.integers(1, u_max)) 
+    offset = int(u + 1) - int(base_positions_min_1b)    
+
+    # Parse original structure
+    parser = PDB.PDBParser(QUIET=True)
+    src_structure = parser.get_structure("src", starting_pdb)
+    src_model = src_structure[0]
+
+    # Copy target chains as-is
+    new_structure = PDB.Structure.Structure("tmp")
+    new_model = PDB.Model.Model(0)
+    new_structure.add(new_model)
+
+    for cid in _parse_chain_ids(target_chains):
+        if cid not in src_model:
+            raise KeyError(f"Target chain '{cid}' not found in {starting_pdb}")
+        new_model.add(copy.deepcopy(src_model[cid]))
+
+    if binder_chain not in src_model:
+        raise KeyError(f"Binder chain '{binder_chain}' not found in {starting_pdb}")
+    src_binder_chain = src_model[binder_chain]
+    src_binder_res = [r for r in src_binder_chain.get_residues() if PDB.is_aa(r, standard=True)]
+
+    # Placeholder GLY chain
+    new_binder_chain = PDB.Chain.Chain(binder_chain)
+
+    # Place placeholder backbone near the target centroid to avoid insane distances
+    try:
+        target_atoms = []
+        for cid in _parse_chain_ids(target_chains):
+            for atom in src_model[cid].get_atoms():
+                if atom.get_id() == "CA":
+                    target_atoms.append(atom.get_coord())
+        if target_atoms:
+            base_xyz = np.mean(np.asarray(target_atoms, dtype=float), axis=0)
+        else:
+            base_xyz = np.zeros(3, dtype=float)
+    except Exception:
+        base_xyz = np.zeros(3, dtype=float)
+
+    def _make_placeholder_res(resname: str, resseq_1b: int) -> PDB.Residue.Residue:
+        res_id = (" ", int(resseq_1b), " ")
+        res = PDB.Residue.Residue(res_id, str(resname), " ")
+        # crude, random-ish backbone coordinates
+        ca = base_xyz + rng.normal(scale=8.0, size=3) + np.array([resseq_1b * 0.5, 0.0, 0.0])
+        n = ca + np.array([-1.2, 0.2, 0.1])
+        c = ca + np.array([1.3, -0.2, -0.1])
+        o = c + np.array([0.6, -0.6, 0.0])
+        res.add(PDB.Atom.Atom("N", n.astype(float), 1.0, 20.0, " ", "N", int(resseq_1b), element="N"))
+        res.add(PDB.Atom.Atom("CA", ca.astype(float), 1.0, 20.0, " ", "CA", int(resseq_1b), element="C"))
+        res.add(PDB.Atom.Atom("C", c.astype(float), 1.0, 20.0, " ", "C", int(resseq_1b), element="C"))
+        res.add(PDB.Atom.Atom("O", o.astype(float), 1.0, 20.0, " ", "O", int(resseq_1b), element="O"))
+        return res
+
+    for i in range(1, int(binder_len) + 1):
+        new_binder_chain.add(_make_placeholder_res("GLY", i))
+
+    # Insert scaffold residues by shifting indices
+    for src_pos_1b in scaffold:
+        if src_pos_1b < 1 or src_pos_1b > len(src_binder_res):
+            continue
+        dst_pos_1b = int(src_pos_1b) + int(offset)
+        if not (1 <= dst_pos_1b <= int(binder_len)):
+            continue
+
+        src_res = src_binder_res[int(src_pos_1b) - 1]
+        new_res = copy.deepcopy(src_res)
+        new_res.id = (" ", int(dst_pos_1b), " ")
+
+        # Replace placeholder at dst position
+        if new_res.id in new_binder_chain:
+            new_binder_chain.detach_child(new_res.id)
+        new_binder_chain.add(new_res)
+
+    # Enforce disulfide cysteine identity at specified indices (0-based binder indices)
+    # This intentionally overrides any scaffold insertion at those positions.
+    ds_positions_1b = set()
+    if ds_pairs_0b:
+        try:
+            for (i0, j0) in ds_pairs_0b:
+                for idx0 in (i0, j0):
+                    idx0i = int(idx0)
+                    if idx0i < 0:
+                        continue
+                    ds_positions_1b.add(idx0i + 1)
+        except Exception:
+            ds_positions_1b = set()
+    for p1 in sorted(ds_positions_1b):
+        if 1 <= int(p1) <= int(binder_len):
+            rid = (" ", int(p1), " ")
+            if rid in new_binder_chain:
+                new_binder_chain.detach_child(rid)
+            new_binder_chain.add(_make_placeholder_res("CYS", int(p1)))
+
+    # Ensure binder residues are ordered by resseq
+    try:
+        new_binder_chain.child_list.sort(key=lambda r: int(r.id[1]))
+    except Exception:
+        pass
+
+    new_model.add(new_binder_chain)
+
+    os.makedirs(out_dir, exist_ok=True)
+    tmp_path = os.path.join(out_dir, f"tmp_scaffold_{int(seed)}_l{int(binder_len)}_off{int(offset)}.pdb")
+    io = PDB.PDBIO()
+    io.set_structure(new_structure)
+    io.save(tmp_path)
+
+    if debug:
+        print("[DEBUG scaffold_pdb] tmp_path:", tmp_path)
+        print("[DEBUG scaffold_pdb] scaffold_len:", len(scaffold))
+        print("[DEBUG scaffold_pdb] base_positions_min_1b:", int(base_positions_min_1b))
+        print("[DEBUG scaffold_pdb] sampled_u:", int(u))
+        print("[DEBUG scaffold_pdb] offset:", int(offset))
+        if ds_positions_1b:
+            print("[DEBUG scaffold_pdb] disulfide CYS positions (1b):", sorted(ds_positions_1b))
+
+    return tmp_path, offset
 
 
 def extract_chain_sequence_from_pdb(pdb_path, chain_id):
@@ -40,41 +231,45 @@ def main():
     settings_path, filters_path, advanced_path, prefilters_path = perform_input_check(args)
     target_settings, advanced_settings, filters, prefilters = load_json_settings(settings_path, filters_path, advanced_path, prefilters_path)
 
+    debug = target_settings.get("debug_mode", False)
+
     # Preserve unshifted base specs for binder_advanced so runtime shifting doesn't compound across trajectories.
     # Prefer specs provided in settings.json; fall back to advanced.json for backward compatibility.
     if target_settings.get("protocol", "binder") == "binder_advanced":
+        scaffold_indices = []
         for key in ("fixed_positions", "template_positions", "sequence_positions"):
             base_key = f"{key}_base"
             # Always prefer the value from settings.json when present; else fall back to advanced.json
             base_val = target_settings.get(key, advanced_settings.get(key))
             advanced_settings[base_key] = base_val
+            advanced_settings[key] = copy.deepcopy(base_val)
+            # Track global min/max across all *_base position specs 
+            def _to_int_list(v):
+                if v is None:
+                    return []
+                if isinstance(v, str):
+                    v = v.strip()
+                    if not v:
+                        return []
+                    return [int(x) for x in v.replace(" ", "").split(",") if x]
+                if isinstance(v, (list, tuple, set)):
+                    return [int(x) for x in v]
+                return [int(v)]
+
+            _vals = _to_int_list(base_val)
+            scaffold_indices.extend(_vals)
+            if _vals:
+                cur_min = advanced_settings.get("base_positions_min")
+                cur_max = advanced_settings.get("base_positions_max")
+                advanced_settings["base_positions_min"] = min(_vals) if cur_min is None else min(cur_min, min(_vals))
+                advanced_settings["base_positions_max"] = max(_vals) if cur_max is None else max(cur_max, max(_vals))
+        advanced_settings["scaffold_indices"] = sorted(set(scaffold_indices))
+        if debug:
+            print("Overall base_positions_min:", advanced_settings["base_positions_min"])
+            print("Overall base_positions_max:", advanced_settings["base_positions_max"])
         # Prefer disulfide_num from settings.json; fallback to advanced.json, default 1
         advanced_settings["disulfide_num"] = int(target_settings.get("disulfide_num", advanced_settings.get("disulfide_num", 1)))
-        # Allow hallucination to optionally use the binder chain in the input PDB as a structural template.
-        advanced_settings["use_template_binder"] = bool(
-            target_settings.get("use_template_binder", advanced_settings.get("use_template_binder", False))
-        )
-        # Debug flag for position/motif/template diagnostics
-        advanced_settings["debug_positions"] = bool(
-            target_settings.get("debug_positions", advanced_settings.get("debug_positions", False))
-        )
 
-        # Optional: explicit structural fixation weight (CA-to-template restraint)
-        # Allow setting from settings.json so users don't need to modify advanced.json.
-        if "weights_template_ca" in target_settings:
-            try:
-                advanced_settings["weights_template_ca"] = float(target_settings["weights_template_ca"])
-            except Exception:
-                pass
-        if "weights_template_ca_rmsd" in target_settings:
-            try:
-                advanced_settings["weights_template_ca_rmsd"] = float(target_settings["weights_template_ca_rmsd"])
-            except Exception:
-                pass
-
-    # if target settings contains max_trajectories, override advanced setting
-    if "max_trajectories" in target_settings:
-        advanced_settings["max_trajectories"] = int(target_settings["max_trajectories"])
 
     settings_file = os.path.basename(settings_path).split(".")[0]
     filters_file = os.path.basename(filters_path).split(".")[0]
@@ -273,50 +468,17 @@ def main():
             return []
 
         if target_settings.get("protocol", "binder") == "binder_advanced":
-            # Reset to base specs each trajectory before shifting/runtime edits
-            advanced_settings["fixed_positions"] = advanced_settings.get("fixed_positions_base")
-            advanced_settings["template_positions"] = advanced_settings.get("template_positions_base")
-            advanced_settings["sequence_positions"] = advanced_settings.get("sequence_positions_base")
-
+            required_min_length = len(advanced_settings["scaffold_indices"])
+            if debug:
+                print("Required minimum binder length based on base positions:", required_min_length)   
             if "lengths" in target_settings and target_settings["lengths"]:
-                min_length = min(target_settings["lengths"])
+                min_length = min(target_settings["lengths"]) if min(target_settings["lengths"]) > required_min_length else required_min_length
                 max_length = max(target_settings["lengths"]) if max(target_settings["lengths"]) > min_length else min_length
                 samples = np.arange(min_length, max_length + 1)
                 length = int(np.random.choice(samples))
             else:
                 # Fallback to the starting binder chain length if no sampling range was provided
                 length = get_chain_length(target_settings["starting_pdb"], "B")
-
-            # If we are using a template binder scaffold, do not crop it; instead ensure binder_len
-            # is at least the scaffold chain length.
-            if bool(advanced_settings.get("use_template_binder", False)):
-                binder_chain_id = target_settings.get("binder_chain", "B")
-                try:
-                    scaffold_len = int(get_chain_length(target_settings["starting_pdb"], binder_chain_id))
-                except Exception:
-                    scaffold_len = 0
-                if scaffold_len and length < scaffold_len:
-                    if advanced_settings.get("debug_positions", False):
-                        print(
-                            "[DEBUG positions] sampled length",
-                            int(length),
-                            "< scaffold_len",
-                            int(scaffold_len),
-                            "-> using scaffold_len",
-                        )
-                    length = int(scaffold_len)
-
-            fixed_pos_1b = _parse_position_spec_to_1based_set(advanced_settings.get("fixed_positions_base"))
-            template_pos_1b = _parse_position_spec_to_1based_set(advanced_settings.get("template_positions_base"))
-            sequence_pos_1b = _parse_position_spec_to_1based_set(advanced_settings.get("sequence_positions_base"))
-
-            ds_pairs_spec_raw = target_settings.get("disulfide_pairs", advanced_settings.get("disulfide_pairs"))
-            ds_pairs_spec_norm = _normalize_disulfide_pairs_spec(ds_pairs_spec_raw)
-            required_min_length = max(
-                _required_min_len_from_specs_1based(fixed_pos_1b | template_pos_1b | sequence_pos_1b),
-                _required_min_len_from_disulfide_pairs(ds_pairs_spec_norm),
-            )
-
             if length < required_min_length:
                 length = int(required_min_length)
         elif target_settings.get("protocol", "binder") == "binder":
@@ -327,6 +489,12 @@ def main():
         else:
             print(f"Invalid protocol specified in settings.json, {target_settings.get('protocol', 'None')}, exiting...")
             sys.exit(1)
+        if debug:
+            print("Selected binder length for this trajectory:", length)
+
+        # if target settings contains max_trajectories, override advanced setting
+        if "max_trajectories" in target_settings:
+            advanced_settings["max_trajectories"] = int(target_settings["max_trajectories"])
 
         advanced_settings["binder_len_runtime"] = int(length)
 
@@ -369,9 +537,54 @@ def main():
             if not valid:
                 ds_pairs = []
 
-        # Store normalized (0-based) disulfide indices for downstream use
-        advanced_settings["disulfide_pairs_runtime"] = ds_pairs
+        # === binder_advanced: build a temporary PDB with shifted scaffold coordinates ===
+        # This implements scaffold shifting by actually moving the scaffold residues in the template binder chain,
+        # rather than only shifting the index bookkeeping.
+        starting_pdb_runtime = target_settings["starting_pdb"]
+        if target_settings.get("protocol", "binder") == "binder_advanced":
+            shuffle_scaffold = bool(
+                target_settings.get(
+                    "shuffle_scaffold_positions",
+                    target_settings.get("shift_motif_positions", False),
+                )
+            )
+            use_template_binder = bool(target_settings.get("use_template_binder", False))
+            binder_chain_id = target_settings.get("binder_chain", "B")
 
+            scaffold_indices = advanced_settings.get("scaffold_indices", [])
+            base_min_1b = advanced_settings.get("base_positions_min")
+
+            if shuffle_scaffold and use_template_binder and scaffold_indices and base_min_1b is not None:
+                tmp_dir = os.path.join(target_settings["design_path"], "tmp_pdbs")
+                tmp_pdb, offset = make_temp_pdb_with_shifted_scaffold(
+                    starting_pdb=target_settings["starting_pdb"],
+                    target_chains=target_settings.get("chains", "A"),
+                    binder_chain=binder_chain_id,
+                    binder_len=int(length),
+                    scaffold_indices_1b=scaffold_indices,
+                    base_positions_min_1b=int(base_min_1b),
+                    ds_pairs_0b=ds_pairs,
+                    seed=int(seed),
+                    out_dir=tmp_dir,
+                    debug=bool(debug),
+                )
+                starting_pdb_runtime = tmp_pdb
+
+                # Shift position specs to match the moved scaffold in the temp PDB.
+                advanced_settings["fixed_positions"] = _shift_position_csv(
+                    advanced_settings.get("fixed_positions_base"), offset, int(length)
+                )
+                advanced_settings["template_positions"] = _shift_position_csv(
+                    advanced_settings.get("template_positions_base"), offset, int(length)
+                )
+                advanced_settings["sequence_positions"] = _shift_position_csv(
+                    advanced_settings.get("sequence_positions_base"), offset, int(length)
+                )
+                advanced_settings["positions_shift_offset_runtime"] = int(offset)
+                if debug:
+                    print("[DEBUG scaffold_pdb] shifted fixed_positions:", advanced_settings.get("fixed_positions"))
+                    print("[DEBUG scaffold_pdb] shifted template_positions:", advanced_settings.get("template_positions"))
+                    print("[DEBUG scaffold_pdb] shifted sequence_positions:", advanced_settings.get("sequence_positions"))
         helicity_value = load_helicity(advanced_settings)
 
         # === binder_advanced: optional shifted motif + random initial binder sequence ===
@@ -518,7 +731,7 @@ def main():
             continue
 
         print(f"Starting trajectory: {design_name}")
-        trajectory = binder_hallucination(design_name, target_settings["starting_pdb"], target_settings.get("protocol", "binder"), target_settings["chains"],
+        trajectory = binder_hallucination(design_name, starting_pdb_runtime, target_settings.get("protocol", "binder"), target_settings["chains"],
                                            target_settings.get("target_hotspot_residues", None), target_settings.get("pos", None), length, seed, ds_pairs, helicity_value,
                                            design_models, advanced_settings, design_paths, failure_csv)
         trajectory_metrics = copy_dict(trajectory._tmp["best"]["aux"]["log"])
