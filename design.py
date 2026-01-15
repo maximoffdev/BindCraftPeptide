@@ -14,6 +14,20 @@ import numpy as np
 from functions import *
 
 
+def _safe_remove(path: str, debug: bool = False):
+    """Remove a file if it exists; never crash the pipeline due to cleanup."""
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            if debug:
+                print(f"[DEBUG scaffold_pdb] removed tmp_pdb: {path}")
+    except Exception as exc:
+        if debug:
+            print(f"[DEBUG scaffold_pdb] WARNING: could not remove tmp_pdb {path}: {exc}")
+
+
 def _parse_chain_ids(chain_spec: str):
     if chain_spec is None:
         return []
@@ -541,6 +555,8 @@ def main():
         # This implements scaffold shifting by actually moving the scaffold residues in the template binder chain,
         # rather than only shifting the index bookkeeping.
         starting_pdb_runtime = target_settings["starting_pdb"]
+         # Track per-trajectory temp PDB (cleanup later if debug is False)
+        tmp_pdb_path = ""
         if target_settings.get("protocol", "binder") == "binder_advanced":
             shuffle_scaffold = bool(
                 target_settings.get(
@@ -569,6 +585,7 @@ def main():
                     debug=bool(debug),
                 )
                 starting_pdb_runtime = tmp_pdb
+                tmp_pdb_path = tmp_pdb
 
                 # Shift position specs to match the moved scaffold in the temp PDB.
                 advanced_settings["fixed_positions"] = _shift_position_csv(
@@ -727,6 +744,8 @@ def main():
         trajectory_exists = any(os.path.exists(os.path.join(design_paths[td], design_name + ".pdb")) for td in trajectory_dirs)
 
         if trajectory_exists:
+            if not debug:
+                _safe_remove(tmp_pdb_path, debug=False)
             trajectory_n += 1
             continue
 
@@ -737,6 +756,9 @@ def main():
         trajectory_metrics = copy_dict(trajectory._tmp["best"]["aux"]["log"])
         trajectory_pdb = os.path.join(design_paths["Trajectory"], design_name + ".pdb")
         trajectory_metrics = {k: round(v, 2) if isinstance(v, float) else v for k, v in trajectory_metrics.items()}
+            # Delete temp PDB right after AF design prep/run, unless debugging
+        if not debug:
+            _safe_remove(tmp_pdb_path, debug=False)
 
         # Save the (target+binder) trajectory sequence as FASTA alongside MPNN FASTAs
         try:
@@ -783,10 +805,11 @@ def main():
                                trajectory_time_text, traj_seq_notes, settings_file, filters_file, advanced_file]
             insert_data(trajectory_csv, trajectory_data)
 
-            print(advanced_settings.get("fixed_positions", None))
-            print(advanced_settings.get("sequence_positions", None))
-            print(trajectory_interface_residues)
-            print(ds_pairs)
+            if debug:
+                print(f"fixed_positions (runtime): {advanced_settings.get('fixed_positions', None)}")
+                print(f"sequence_positions (runtime): {advanced_settings.get('sequence_positions', None)}")
+                print(f"trajectory_interface_residues: {trajectory_interface_residues}")
+                print(f"disulfide_pairs (0-based): {ds_pairs}")
 
             # Build fixed MPNN scaffold positions in the same "B{resnum}" format as trajectory_interface_residues
             def _parse_pos_list(v):
@@ -810,7 +833,8 @@ def main():
                 for pos in (fixed_positions_set | sequence_positions_set | ds_positions_set)
             }
 
-            print(fixed_mpnn_scaffold)
+            if debug:
+                print(f"fixed_mpnn_scaffold: {fixed_mpnn_scaffold}")
 
             if not trajectory_interface_residues:
                 print(f"No interface residues found for {design_name}, skipping MPNN optimization")
