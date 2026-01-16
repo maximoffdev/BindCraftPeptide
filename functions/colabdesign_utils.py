@@ -67,25 +67,6 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
         fixed_positions = advanced_settings.get("fixed_positions", None)
         template_positions = advanced_settings.get("template_positions", None)
         sequence_positions = advanced_settings.get("sequence_positions", None)
-
-        # Structural fixation (template CA restraint):
-        # If using a template binder scaffold, default-enable a CA restraint when any
-        # structure-related positions are specified, unless the user explicitly sets weight 0.
-        _sentinel = object()
-        _w_ca = advanced_settings.get("weights_template_ca", _sentinel)
-        if _w_ca is _sentinel:
-            _w_ca = advanced_settings.get("weights_template_ca_rmsd", _sentinel)
-        if _w_ca is _sentinel:
-            if bool(advanced_settings.get("use_template_binder", False)) and (fixed_positions or template_positions):
-                _w_ca = 1.0
-                if bool(advanced_settings.get("debug_positions", False)):
-                    print("[DEBUG positions] weights_template_ca_rmsd not set; defaulting to 1.0 due to use_template_binder + fixed/template positions")
-            else:
-                _w_ca = 0.0
-        try:
-            template_ca_weight = float(_w_ca)
-        except Exception:
-            template_ca_weight = 0.0
         
         # Handle disulfide pairs automatically
         if ds_pairs and len(ds_pairs) > 0:
@@ -115,20 +96,12 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
             pdb_filename=starting_pdb,
             target_chain="A",
             binder_chain="B",
-            binder_len=length,
             fixed_positions=fixed_positions,
             template_positions=template_positions,
             sequence_positions=sequence_positions,
-            seed=seed,
-            init_binder_seq=advanced_settings.get("init_binder_seq_runtime"),
-            init_binder_locked_map=advanced_settings.get("init_binder_locked_map_runtime"),
-            scaffold_pos_map=advanced_settings.get("scaffold_pos_map_runtime"),
             hotspot=target_hotspot_residues,
             rm_target_sc=advanced_settings["rm_template_sc_design"],
-            rm_target_seq=advanced_settings["rm_template_seq_design"],
-            use_template_binder=bool(advanced_settings.get("use_template_binder", False)),
-            debug_positions=bool(advanced_settings.get("debug_positions", False)),
-            template_ca_weight=template_ca_weight,
+            rm_target_seq=advanced_settings["rm_template_seq_design"]
         )      
 
 
@@ -168,32 +141,18 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
                                                                        advanced_settings.get("disulfide_num", 1), 
                                                                        advanced_settings.get("disulfide_min_sep", 5))
         else:
-            # keep provided pattern; actual cysteine enforcement is done via bias below
-            sequence_pattern = None
+            # construct binder-only sequence pattern with Cs
+            sp = ["X"] * length
+            for i, j in ds_pairs:
+                sp[i] = "C"; sp[j] = "C"
+            sequence_pattern = "".join(sp)
 
         if ds_pairs and len(ds_pairs) > 0:
-            # Enforce cysteines at disulfide sites via bias (avoid restart())
+            # seed sequence and restrict additional cysteines
             try:
-                restype_order = getattr(residue_constants, "restype_order", None)
-                if restype_order is None:
-                    restype_order = {aa: i for i, aa in enumerate(list("ARNDCQEGHILKMFPSTWYV"))}
-                c_idx = restype_order.get("C")
-                if c_idx is not None:
-                    bias = af_model._inputs.get("bias")
-                    if bias is None:
-                        bias = np.zeros((1, af_model._len, 20), dtype=np.float32)
-                    elif bias.ndim == 2:
-                        bias = bias[None, ...]
-
-                    T = int(getattr(af_model, "_target_len", 0))
-                    for i, j in ds_pairs:
-                        for idx0 in (int(i), int(j)):
-                            if 0 <= idx0 < int(length):
-                                g = T + idx0
-                                bias[0, g, :] = -1e3
-                                bias[0, g, c_idx] = 1e3
-                    af_model._inputs["bias"] = bias
+                af_model.restart(seq=sequence_pattern, add_seq=True, rm_aa='C')
             except Exception:
+                # if restart fails (API differences), continue without seeding
                 pass
             # store pattern for loss and downstream stapling
             af_model.opt["disulfide_pattern"] = ds_pairs
@@ -1052,12 +1011,7 @@ class mk_af_model_advanced(mk_af_model):
         return 0
 
     def _apply_seq_grad_mask(self):
-        """Zero sequence gradients for positions that must remain fixed.
-
-        Notes:
-        - ColabDesign gradients can be JAX arrays; do not rely on in-place mutation.
-        - We assign masked arrays back into the grad tree to ensure the optimizer sees it.
-        """
+        """Zero sequence gradients for binder positions that must remain fixed."""
         if not hasattr(self, "aux") or "grad" not in self.aux:
             return
 
@@ -1078,59 +1032,37 @@ class mk_af_model_advanced(mk_af_model):
         if not mask_candidates:
             return
 
-        def _pick_mask(arr):
-            if arr is None:
-                return None
-            ndim = getattr(arr, "ndim", None)
-            shape = getattr(arr, "shape", None)
-            if ndim is None or shape is None:
+        def _match_mask(arr):
+            if arr is None or not isinstance(arr, np.ndarray):
                 return None
             for mask in mask_candidates:
                 if mask.ndim != 1:
                     continue
-                # grad arrays can be [N, L, 20] or [L, 20] or [L]
-                if ndim == 3 and mask.shape[0] == shape[1]:
-                    return mask
-                if ndim == 2 and mask.shape[0] == shape[0]:
-                    return mask
-                if ndim == 1 and mask.shape[0] == shape[0]:
-                    return mask
+                if arr.ndim == 3 and mask.shape[0] == arr.shape[1]:
+                    return mask.astype(arr.dtype)
+                if arr.ndim == 2 and mask.shape[0] == arr.shape[0]:
+                    return mask.astype(arr.dtype)
+                if arr.ndim == 1 and mask.shape[0] == arr.shape[0]:
+                    return mask.astype(arr.dtype)
             return None
 
-        def _apply_mask(arr):
-            mask = _pick_mask(arr)
+        def _apply(arr):
+            mask = _match_mask(arr)
             if mask is None:
-                return arr
-            # Prefer JAX for JAX arrays
-            try:
-                m = jnp.asarray(mask, dtype=getattr(arr, "dtype", jnp.float32))
-                if getattr(arr, "ndim", 0) == 3:
-                    return arr * m[None, :, None]
-                if getattr(arr, "ndim", 0) == 2:
-                    return arr * m[:, None]
-                if getattr(arr, "ndim", 0) == 1:
-                    return arr * m
-                return arr
-            except Exception:
-                m = np.asarray(mask, dtype=np.float32)
-                a = np.asarray(arr)
-                if a.ndim == 3:
-                    return a * m[None, :, None]
-                if a.ndim == 2:
-                    return a * m[:, None]
-                if a.ndim == 1:
-                    return a * m
-                return a
+                return
+            if arr.ndim == 3:
+                arr *= mask[None, :, None]
+            elif arr.ndim == 2:
+                arr *= mask[:, None]
+            elif arr.ndim == 1:
+                arr *= mask
 
         if isinstance(grad_seq, dict):
-            for key in ("logits", "pseudo", "onehot", "pssm"):
-                if key in grad_seq and grad_seq[key] is not None:
-                    grad_seq[key] = _apply_mask(grad_seq[key])
-            grad_root["seq"] = grad_seq
-        else:
-            grad_root["seq"] = _apply_mask(grad_seq)
-
-        self.aux["grad"] = grad_root
+            _apply(grad_seq.get("logits"))
+            for key in ("pseudo", "onehot", "pssm"):
+                _apply(grad_seq.get(key))
+        elif isinstance(grad_seq, np.ndarray):
+            _apply(grad_seq)
 
     def step(self, lr_scale=1.0, num_recycles=None,
              num_models=None, sample_models=None, models=None, backprop=True,
@@ -1313,9 +1245,6 @@ def prep_binder_advanced(af_model, pdb_filename,
                         rm_target_sc=False,
                         ignore_missing=True,
                         seed=None,
-                        use_template_binder=False,
-                        debug_positions=False,
-                        template_ca_weight=0.0,
                         **kwargs):
     """
     Advanced binder prep with fine-grained positional control.
@@ -1379,25 +1308,12 @@ def prep_binder_advanced(af_model, pdb_filename,
         )
     """
     
-    # Parse the PDB structure.
-    # In hallucination mode (binder_len provided), we normally do NOT load the existing binder chain.
-    # For peptide motif scaffolding we optionally load it (use_template_binder=True) so template
-    # coordinates are available for fixed/template positions.
-    if binder_len is not None:
-        chains_to_load = (
-            f"{target_chain},{binder_chain}" if (use_template_binder and binder_chain) else target_chain
-        )
-    else:
-        chains_to_load = f"{target_chain},{binder_chain}" if binder_chain else target_chain
+    # Parse the PDB structure first to check what's in it
+    chains_to_load = f"{target_chain},{binder_chain}" if binder_chain else target_chain
     im = [True] * len(chains_to_load.split(","))
     af_model._pdb = prep_pdb(pdb_filename, chain=chains_to_load, ignore_missing=im)
-
-    if debug_positions:
-        print("[DEBUG positions] prep_binder_advanced: chains_to_load:", chains_to_load)
-        print("[DEBUG positions] prep_binder_advanced: use_template_binder:", bool(use_template_binder))
-        print("[DEBUG positions] prep_binder_advanced: binder_len arg:", binder_len)
     
-    # Check if binder exists in PDB (only meaningful when we loaded it)
+    # Check if binder exists in PDB
     available_chains = set(af_model._pdb["idx"]["chain"])
     has_binder_in_pdb = binder_chain in available_chains
     
@@ -1410,10 +1326,8 @@ def prep_binder_advanced(af_model, pdb_filename,
         # HALLUCINATION MODE: Create new binder
         redesign = False
         print(f"✨ Hallucination mode: Creating new binder of length {binder_len}")
-        if has_binder_in_pdb and not use_template_binder:
+        if has_binder_in_pdb:
             print(f"   Note: Ignoring existing chain {binder_chain} in PDB")
-        if has_binder_in_pdb and use_template_binder:
-            print(f"   Using template binder chain {binder_chain} as structural scaffold")
     else:
         raise ValueError(
             f"Must specify either binder_len (hallucination) or have binder_chain='{binder_chain}' in PDB (redesign)"
@@ -1426,10 +1340,6 @@ def prep_binder_advanced(af_model, pdb_filename,
     af_model._target_len = sum([(af_model._pdb["idx"]["chain"] == c).sum() 
                                 for c in target_chain.split(",")])
     
-    template_binder_len = 0
-    if has_binder_in_pdb:
-        template_binder_len = int(sum([(af_model._pdb["idx"]["chain"] == c).sum() for c in binder_chain.split(",")]))
-
     if redesign:
         # REDESIGN MODE: Get binder length from PDB
         af_model._binder_len = sum([(af_model._pdb["idx"]["chain"] == c).sum() 
@@ -1437,67 +1347,16 @@ def prep_binder_advanced(af_model, pdb_filename,
         res_idx = af_model._pdb["residue_index"]
     else:
         # HALLUCINATION MODE: Use specified length
-        if binder_len is None:
-            raise ValueError("binder_len must be provided in hallucination mode")
-        af_model._binder_len = int(binder_len)
-
-        # Do NOT crop the scaffold. If template binder is loaded and longer than the sampled length,
-        # bump binder_len up to the scaffold length.
-        if use_template_binder and has_binder_in_pdb and template_binder_len > 0 and int(af_model._binder_len) < int(template_binder_len):
-            if debug_positions:
-                print(
-                    "[DEBUG positions] sampled binder_len",
-                    int(af_model._binder_len),
-                    "< template_binder_len",
-                    int(template_binder_len),
-                    "-> using template_binder_len",
-                )
-            af_model._binder_len = int(template_binder_len)
-
-        if use_template_binder and has_binder_in_pdb and template_binder_len > 0:
-            template_keep = int(template_binder_len)
-
-            # Build residue_index using the full scaffold residue_index,
-            # and extend sequentially if binder_len exceeds scaffold length.
-            target_res_idx = np.asarray(af_model._pdb["residue_index"][:af_model._target_len], dtype=int)
-            binder_res_idx_template = np.asarray(
-                af_model._pdb["residue_index"][af_model._target_len:af_model._target_len + template_keep],
-                dtype=int,
-            )
-            if int(af_model._binder_len) <= int(template_keep):
-                binder_res_idx = binder_res_idx_template[: int(af_model._binder_len)]
-            else:
-                extra = int(af_model._binder_len) - int(template_keep)
-                last = int(binder_res_idx_template[-1]) if binder_res_idx_template.size > 0 else int(target_res_idx[-1]) + 50
-                binder_res_idx = np.concatenate([
-                    binder_res_idx_template,
-                    last + np.arange(1, extra + 1, dtype=int),
-                ])
-            res_idx = np.concatenate([target_res_idx, binder_res_idx])
-        else:
-            # Fallback: synthetic binder residue_index with chain break
-            target_res_idx = np.asarray(af_model._pdb["residue_index"][:af_model._target_len], dtype=int)
-            res_idx = np.append(target_res_idx, target_res_idx[-1] + np.arange(int(af_model._binder_len), dtype=int) + 50)
+        af_model._binder_len = binder_len
+        res_idx = af_model._pdb["residue_index"]
+        # Add 50-residue gap + binder indices (following ColabDesign convention)
+        res_idx = np.append(res_idx, res_idx[-1] + np.arange(binder_len) + 50)
     
     # CRITICAL: _len must be FULL complex length for proper sequence initialization
     af_model._lengths = [af_model._target_len, af_model._binder_len]
     af_model._len = sum(af_model._lengths)
-
-    # Sanity check: residue_index should match full complex length
-    if len(res_idx) != af_model._len:
-        raise ValueError(
-            f"prep_binder_advanced: residue_index length {len(res_idx)} != full length {af_model._len}. "
-            f"target_len={af_model._target_len}, binder_len={af_model._binder_len}, redesign={redesign}"
-        )
     
     print(f"Target length: {af_model._target_len}, Binder length: {af_model._binder_len}")
-
-    if debug_positions:
-        print("[DEBUG positions] prep_binder_advanced: redesign:", bool(redesign))
-        print("[DEBUG positions] prep_binder_advanced: template_binder_len:", int(template_binder_len))
-        if not redesign and use_template_binder and template_binder_len > 0:
-            if int(af_model._binder_len) > int(template_binder_len):
-                print("[DEBUG positions] binder_len exceeds template binder; extension will be hallucinated")
     
     # Gather hotspot info (following _prep_binder pattern)
     if hotspot is not None:
@@ -1516,8 +1375,7 @@ def prep_binder_advanced(af_model, pdb_filename,
             "i_pae": 0.0
         })
     else:
-        # HALLUCINATION MODE: Ensure batch matches full complex length.
-        # If template binder is loaded, we already cropped to the overlap above; now we pad to binder_len.
+        # HALLUCINATION MODE: Expand batch to include binder
         af_model._pdb["batch"] = make_fixed_size(af_model._pdb["batch"], num_res=sum(af_model._lengths))
         af_model.opt["weights"].update({
             "plddt": 0.1,
@@ -1538,59 +1396,6 @@ def prep_binder_advanced(af_model, pdb_filename,
     sequence_pos_array = np.array([], dtype=int)
     redesign_pos_array = np.arange(af_model._binder_len)  # Default: all positions
     
-    init_binder_seq = kwargs.pop("init_binder_seq", None)
-    init_binder_locked_map = kwargs.pop("init_binder_locked_map", None)
-    scaffold_pos_map = kwargs.pop("scaffold_pos_map", None)
-
-    if debug_positions:
-        print("[DEBUG positions] raw fixed_positions spec:", fixed_positions)
-        print("[DEBUG positions] raw template_positions spec:", template_positions)
-        print("[DEBUG positions] raw sequence_positions spec:", sequence_positions)
-        if init_binder_seq is not None:
-            print("[DEBUG positions] init_binder_seq len:", len(str(init_binder_seq)))
-        if init_binder_locked_map is not None:
-            print("[DEBUG positions] init_binder_locked_map (1-based->AA):", init_binder_locked_map)
-
-    def _aa_idx_to_letter(idx: int) -> str:
-        try:
-            inv = {v: k for k, v in residue_constants.restype_order.items()}
-            return inv.get(int(idx), "?")
-        except Exception:
-            return "?"
-
-    def _debug_dump_positions(label: str, pos_arr: np.ndarray):
-        if not debug_positions:
-            return
-        T = int(af_model._target_len)
-        Lb = int(af_model._binder_len)
-        tmpl = int(template_binder_len)
-        pos_list = []
-        try:
-            pos_list = [int(x) for x in np.asarray(pos_arr).tolist()]
-        except Exception:
-            pos_list = []
-        print(f"[DEBUG positions] {label} positions (binder-local 0-based):", sorted(set(pos_list)))
-        for p in sorted(set(pos_list)):
-            if p < 0 or p >= Lb:
-                continue
-            g = T + p
-            within_template = bool(has_binder_in_pdb and tmpl > 0 and p < tmpl)
-            aa_template = None
-            try:
-                aa_template = _aa_idx_to_letter(int(af_model._pdb["batch"]["aatype"][g]))
-            except Exception:
-                aa_template = None
-            aa_init = None
-            if init_binder_seq is not None:
-                try:
-                    aa_init = str(init_binder_seq)[p]
-                except Exception:
-                    aa_init = None
-            print(
-                f"[DEBUG positions]  pos {p+1} (0b={p}) global={g} within_template={within_template} "
-                f"templateAA={aa_template} initAA={aa_init}"
-            )
-
     # Helper function to parse positions with chain-aware handling
     def parse_binder_positions(pos_string, binder_chain):
         """
@@ -1599,61 +1404,32 @@ def prep_binder_advanced(af_model, pdb_filename,
         """
         if pos_string is None or pos_string == "":
             return np.array([], dtype=int)
-
-        s = str(pos_string).replace(" ", "")
-        if not s:
-            return np.array([], dtype=int)
-
-        tokens = [t for t in s.split(",") if t]
-        def _looks_chain_aware(token: str) -> bool:
-            return len(token) >= 2 and token[0].isalpha() and (token[1].isdigit() or token[1] == "-")
-
-        # Hallucination mode: binder is not reliably addressable in PDB numbering
-        # (even if we loaded the template binder). Treat non-prefixed specs as binder-local.
-        chain_aware = any(_looks_chain_aware(t.split("-", 1)[0]) for t in tokens)
-        if not redesign:
-            chain_aware = False
-
-        if chain_aware:
-            # Chain-aware: use prep_pos and map global -> binder-local
-            pos_dict = prep_pos(s, **af_model._pdb["idx"])
+        
+        # Check if positions already have chain prefix (e.g., "B116,B117")
+        if any(c.isalpha() for c in pos_string.split(',')[0].split('-')[0]):
+            # Chain-aware format: use prep_pos and filter to binder
+            pos_dict = prep_pos(pos_string, **af_model._pdb["idx"])
             pos_global = pos_dict["pos"]
-            pos_local = np.array(
-                [p - af_model._target_len for p in pos_global if p >= af_model._target_len],
-                dtype=int,
-            )
-            pos_local = pos_local[(pos_local >= 0) & (pos_local < int(af_model._binder_len))]
-            return np.array(sorted(set(pos_local.tolist())), dtype=int)
-
-        # Binder-local numeric parsing (1-based -> 0-based)
-        vals_1b = []
-        for part in tokens:
-            # strip optional leading chain letter defensively
-            if _looks_chain_aware(part):
-                part = part[1:]
-            if "-" in part[1:]:
-                a_str, b_str = part.split("-", 1)
-                try:
-                    a = int(a_str)
-                    b = int(b_str)
-                except ValueError:
-                    continue
-                step = 1 if b >= a else -1
-                vals_1b.extend(list(range(a, b + step, step)))
-            else:
-                try:
-                    vals_1b.append(int(part))
-                except ValueError:
-                    continue
-
-        out = []
-        for p1 in vals_1b:
-            if p1 <= 0:
-                continue
-            p0 = p1 - 1
-            if 0 <= p0 < int(af_model._binder_len):
-                out.append(p0)
-        return np.array(sorted(set(out)), dtype=int)
+            # Convert to binder-local (0-based)
+            pos_local = np.array([p - af_model._target_len 
+                                  for p in pos_global 
+                                  if p >= af_model._target_len], dtype=int)
+        else:
+            # Simple numeric format: treat as binder-local 1-based positions
+            # Parse ranges like "1-3,5,7-9" -> [1,2,3,5,7,8,9]
+            # Then convert to 0-based indices
+            # Add binder chain prefix for prep_pos
+            prefixed = ','.join([
+                f"{binder_chain}{item}" for item in pos_string.split(',')
+            ])
+            pos_dict = prep_pos(prefixed, **af_model._pdb["idx"])
+            pos_global = pos_dict["pos"]
+            # Convert to binder-local (0-based)
+            pos_local = np.array([p - af_model._target_len 
+                                  for p in pos_global 
+                                  if p >= af_model._target_len], dtype=int)
+        
+        return pos_local
     
     # Parse each position specification
     if fixed_positions:
@@ -1667,14 +1443,10 @@ def prep_binder_advanced(af_model, pdb_filename,
     if sequence_positions:
         sequence_pos_array = parse_binder_positions(sequence_positions, binder_chain)
         print(f"Sequence-fixed positions (binder-local 0-based): {sequence_pos_array}")
-
-    _debug_dump_positions("fixed(raw)", fixed_pos_array)
-    _debug_dump_positions("template(raw)", template_pos_array)
-    _debug_dump_positions("sequence(raw)", sequence_pos_array)
     
     # Build mutually-exclusive position sets immediately so we can correctly
     # determine which positions are sequence-designable (template + redesign)
-    binder_len_local = int(af_model._binder_len or 0)
+    binder_len_local = int(af_model._binder_len)
     all_binder_pos = set(range(binder_len_local))
     fixed_set = set(fixed_pos_array)
     template_set = set(template_pos_array) - fixed_set
@@ -1694,20 +1466,6 @@ def prep_binder_advanced(af_model, pdb_filename,
     sequence_pos_array = np.array(sorted(sequence_set), dtype=int)
     fixed_pos_array = np.array(sorted(fixed_set), dtype=int)
 
-    _debug_dump_positions("fixed(final)", fixed_pos_array)
-    _debug_dump_positions("template(final)", template_pos_array)
-    _debug_dump_positions("sequence(final)", sequence_pos_array)
-
-    if debug_positions and (not redesign) and use_template_binder and template_binder_len > 0:
-        struct_fixed = sorted(set(int(x) for x in fixed_pos_array.tolist()) | set(int(x) for x in template_pos_array.tolist()))
-        oob = [p for p in struct_fixed if p >= int(template_binder_len)]
-        if oob:
-            print(
-                "[DEBUG positions] WARNING: structural-fixed positions outside template binder overlap:",
-                oob,
-                "template_binder_len=", int(template_binder_len),
-            )
-
     print(f"Redesign positions (binder-local): {redesign_pos_array}")
 
     # === Set up designable positions (CRITICAL for sequence optimization) ===
@@ -1724,7 +1482,7 @@ def prep_binder_advanced(af_model, pdb_filename,
 
     seq_grad_mask_global = np.zeros(sum(af_model._lengths), dtype=np.float32)
     seq_grad_mask_global[designable_global] = 1.0
-    seq_grad_mask_binder = np.zeros(int(af_model._binder_len or 0), dtype=np.float32)
+    seq_grad_mask_binder = np.zeros(af_model._binder_len, dtype=np.float32)
     seq_grad_mask_binder[binder_designable] = 1.0
 
     af_model.opt["pos"] = binder_designable
@@ -1836,136 +1594,26 @@ def prep_binder_advanced(af_model, pdb_filename,
     af_model._inputs["bias"] = bias
     print(f"🔒 Target sequence locked (positions 0-{af_model._target_len-1})")
 
-    # === Apply initial binder sequence / locks (works in redesign and hallucination) ===
-    # Use bias seeding to avoid relying on restart(seq=...), which can reset opt fields.
-    binder_restype_order = getattr(residue_constants, "restype_order", None)
-    if binder_restype_order is None:
-        binder_restype_order = {aa: i for i, aa in enumerate(list("ARNDCQEGHILKMFPSTWYV"))}
-
-    if init_binder_seq:
-        init_binder_seq = str(init_binder_seq).strip().upper()
-        binder_len_int = int(af_model._binder_len or 0)
-        if len(init_binder_seq) != binder_len_int:
-            print(f"Warning: init_binder_seq length {len(init_binder_seq)} != binder_len {af_model._binder_len}; ignoring init_binder_seq")
-        else:
-            bias = af_model._inputs.get("bias")
-            if bias is None:
-                bias = np.zeros((1, af_model._len, 20), dtype=np.float32)
-            elif bias.ndim == 2:
-                bias = bias[None, ...]
-
-            # Mildly bias every binder position toward the provided initial AA
-            init_bias = float(kwargs.pop("init_binder_seq_bias", 5.0))
-            T = int(af_model._target_len)
-            for pos0, aa in enumerate(init_binder_seq):
-                aa_idx = binder_restype_order.get(aa)
-                if aa_idx is None:
-                    continue
-                bias[0, T + pos0, aa_idx] += init_bias
-
-            af_model._inputs["bias"] = bias
-
-    if init_binder_locked_map:
-        bias = af_model._inputs.get("bias")
-        if bias is None:
-            bias = np.zeros((1, af_model._len, 20), dtype=np.float32)
-        elif bias.ndim == 2:
-            bias = bias[None, ...]
-
-        T = int(af_model._target_len)
-        for p1_str, aa in dict(init_binder_locked_map).items():
-            try:
-                p1 = int(p1_str)
-            except Exception:
-                continue
-            if p1 <= 0:
-                continue
-            pos0 = p1 - 1
-            if not (0 <= pos0 < int(af_model._binder_len or 0)):
-                continue
-            aa = str(aa).strip().upper()
-            aa_idx = binder_restype_order.get(aa)
-            if aa_idx is None:
-                continue
-            global_pos = T + pos0
-            bias[0, global_pos, :] = -1e3
-            bias[0, global_pos, aa_idx] = 1e3
-
-        af_model._inputs["bias"] = bias
-        print(f"🔒 Binder injected/locked residues applied: {len(init_binder_locked_map)}")
-
     # === Lock binder sequence-fixed positions ===
     # Apply strong bias to binder positions that should keep their sequence
     positions_to_lock = sorted(list(fixed_set | sequence_set))
     
-    if len(positions_to_lock) > 0 and (redesign or (use_template_binder and template_binder_len > 0) or (init_binder_seq is not None) or (init_binder_locked_map is not None)):
-        # In redesign mode, lock to the PDB wild-type.
-        # In hallucination mode, lock to the intended designed sequence (init_binder_locked_map/init_binder_seq)
-        # to avoid overwriting injected motifs and disulfide cysteines with template binder residues.
+    if len(positions_to_lock) > 0 and redesign:
+        # Extract the wild-type sequence from the PDB for these positions
         wt_sequence = af_model._pdb["batch"]["aatype"][af_model._target_len:]
-
-        max_lockable = int(af_model._binder_len or 0)
-        # If we don't have an explicit intended sequence for hallucination and are using template binder,
-        # restrict locking to the template overlap to avoid locking padded residues to arbitrary aatype.
-        if (not redesign) and init_binder_seq is None and not init_binder_locked_map and use_template_binder and template_binder_len > 0:
-            max_lockable = min(max_lockable, int(template_binder_len))
         
         # Use the bias matrix already created above
         bias = af_model._inputs["bias"]
         
         # Lock each binder position with extreme bias
-        locked_debug = []
-
-        lock_map = {}
-        if init_binder_locked_map:
-            # normalize keys to int (1-based)
-            for k, v in dict(init_binder_locked_map).items():
-                try:
-                    k_int = int(k)
-                except Exception:
-                    continue
-                lock_map[k_int] = str(v).strip().upper()
         for pos in positions_to_lock:
-            if pos < 0 or pos >= max_lockable:
-                continue
             global_pos = af_model._target_len + pos
-            chosen_aa_idx = None
-            chosen_src = None
-
-            # 1) Explicit per-position lock map (1-based)
-            aa_letter = lock_map.get(int(pos) + 1)
-            if aa_letter is not None:
-                chosen_aa_idx = binder_restype_order.get(aa_letter)
-                chosen_src = "locked_map"
-
-            # 2) Otherwise, use init_binder_seq if provided (hallucination intended sequence)
-            if chosen_aa_idx is None and init_binder_seq is not None:
-                try:
-                    aa_letter2 = str(init_binder_seq)[int(pos)].upper()
-                except Exception:
-                    aa_letter2 = None
-                if aa_letter2:
-                    chosen_aa_idx = binder_restype_order.get(aa_letter2)
-                    chosen_src = "init_seq"
-
-            # 3) Fallback: template/PDB wild-type
-            if chosen_aa_idx is None:
-                chosen_aa_idx = int(wt_sequence[pos])
-                chosen_src = "template_wt"
-
+            wt_aa = int(wt_sequence[pos])
             bias[0, global_pos, :] = -1e3
-            bias[0, global_pos, chosen_aa_idx] = 1e3
-
-            if debug_positions:
-                locked_debug.append((int(pos), str(chosen_src), _aa_idx_to_letter(int(chosen_aa_idx))))
+            bias[0, global_pos, wt_aa] = 1e3
         
         af_model._inputs["bias"] = bias
         print(f"🔒 Binder sequence-fixed positions locked: {positions_to_lock}")
-        if debug_positions:
-            print("[DEBUG positions] binder seq-fixed lock AAs (0-based->src->AA):", locked_debug)
-            skipped = [p for p in positions_to_lock if p < 0 or p >= max_lockable]
-            if skipped:
-                print("[DEBUG positions] binder seq-fixed skipped (no template overlap):", skipped)
     
     # Store position information for later reference
     af_model._custom_positions = {
@@ -1974,122 +1622,6 @@ def prep_binder_advanced(af_model, pdb_filename,
         "sequence": list(sequence_set) if 'sequence_set' in locals() else list(sequence_pos_array),
         "redesign": list(redesign_set) if 'redesign_set' in locals() else list(redesign_pos_array)
     }
-
-    # === Optional: Structural fixation via explicit CA-template restraint ===
-    # Template masking alone often does not fully prevent structural drift in hallucination.
-    # This adds a differentiable restraint on CA positions for fixed+template residues.
-    try:
-        template_ca_weight_f = float(template_ca_weight or 0.0)
-    except Exception:
-        template_ca_weight_f = 0.0
-
-    if template_ca_weight_f > 0:
-        # Only meaningful if we have template coordinates loaded.
-        if has_binder_in_pdb and template_binder_len > 0:
-            struct_fixed_local = sorted(set(fixed_set) | set(template_set))
-
-            # In hallucination mode with a template binder scaffold, ONLY restrain positions that can be
-            # referenced back to the ORIGINAL scaffold coordinates (pre-shift). That means:
-            # - apply loss at shifted positions (in struct_fixed_local)
-            # - reference coords at base positions using scaffold_pos_map (shifted0b -> base0b)
-            if (not redesign) and use_template_binder:
-                # keep apply positions within current binder length
-                struct_fixed_local = [p for p in struct_fixed_local if 0 <= int(p) < int(af_model._binder_len)]
-
-            if len(struct_fixed_local) == 0:
-                if debug_positions:
-                    print("[DEBUG positions] template_ca restraint: no positions to restrain")
-            else:
-                batch = af_model._pdb.get("batch", {})
-                atom_pos = None
-                atom_mask = None
-                if isinstance(batch, dict):
-                    atom_pos = batch.get("all_atom_positions", None)
-                    atom_mask = batch.get("all_atom_mask", None)
-                    if atom_pos is None:
-                        atom_pos = batch.get("atom_positions", None)
-                    if atom_mask is None:
-                        atom_mask = batch.get("atom_mask", None)
-
-                if atom_pos is None or atom_mask is None:
-                    print(
-                        "Warning: template_ca restraint requested but template atom coordinates not found in prep_pdb batch; skipping restraint"
-                    )
-                else:
-                    ca_idx = int(residue_constants.atom_order["CA"])
-                    T_int = int(af_model._target_len)
-
-                    # Build aligned (apply_global_idx, ref_global_idx) pairs
-                    pairs = []
-                    map_dict = scaffold_pos_map if isinstance(scaffold_pos_map, dict) else {}
-
-                    for p_shift in struct_fixed_local:
-                        p_shift_i = int(p_shift)
-                        # Reference: base position (unshifted scaffold) if provided, else identity
-                        p_base_i = int(map_dict.get(p_shift_i, p_shift_i))
-
-                        # Only restrain if we actually have template coordinates for the reference
-                        if 0 <= p_base_i < int(template_binder_len):
-                            pairs.append((T_int + p_shift_i, T_int + p_base_i))
-
-                    if len(pairs) == 0:
-                        if debug_positions:
-                            print("[DEBUG positions] template_ca restraint: no valid reference positions in template overlap; skipping")
-                    else:
-                        apply_global_idx = np.asarray([a for (a, _) in pairs], dtype=int)
-                        ref_global_idx = np.asarray([r for (_, r) in pairs], dtype=int)
-
-                        # Filter to positions with CA present in template reference
-                        try:
-                            ca_present = np.asarray(atom_mask)[ref_global_idx, ca_idx] > 0.5
-                        except Exception:
-                            ca_present = np.ones((len(ref_global_idx),), dtype=bool)
-
-                        apply_global_idx = apply_global_idx[ca_present]
-                        ref_global_idx = ref_global_idx[ca_present]
-
-                        if apply_global_idx.size == 0:
-                            if debug_positions:
-                                print("[DEBUG positions] template_ca restraint: all reference CA atoms missing; skipping")
-                        else:
-                            template_ca = np.asarray(atom_pos)[ref_global_idx, ca_idx, :].astype(np.float32)
-                            template_ca_mask = np.asarray(atom_mask)[ref_global_idx, ca_idx].astype(np.float32)
-
-                            pos_apply_jnp = jnp.asarray(apply_global_idx.astype(np.int32))
-                            template_ca_jnp = jnp.asarray(template_ca)
-                            template_ca_mask_jnp = jnp.asarray(template_ca_mask)
-
-                            def _template_ca_loss_fn(inputs, outputs):
-                                xyz = outputs["structure_module"]["final_atom_positions"]
-                                ca = xyz[:, residue_constants.atom_order["CA"]]
-                                pred = ca[pos_apply_jnp]
-                                diff = pred - template_ca_jnp
-                                per = jnp.sum(diff * diff, axis=-1)
-                                w = template_ca_mask_jnp
-                                denom = jnp.maximum(jnp.sum(w), 1e-6)
-                                loss_val = jnp.sum(per * w) / denom
-                                return {"template_ca": loss_val}
-
-                            af_model._callbacks["model"]["loss"].append(_template_ca_loss_fn)
-                            af_model.opt["weights"]["template_ca"] = template_ca_weight_f
-                            if debug_positions:
-                                print(
-                                    "[DEBUG positions] template_ca restraint enabled (shifted->base mapping applied):",
-                                    "n=", int(apply_global_idx.size),
-                                    "weight=", float(template_ca_weight_f),
-                                )
-                                # Print a small sample mapping for sanity
-                                try:
-                                    sample_n = int(min(10, apply_global_idx.size))
-                                    print(
-                                        "[DEBUG positions] template_ca apply_global->ref_global sample:",
-                                        list(zip(apply_global_idx[:sample_n].tolist(), ref_global_idx[:sample_n].tolist())),
-                                    )
-                                except Exception:
-                                    pass
-        else:
-            if debug_positions:
-                print("[DEBUG positions] template_ca restraint requested but no template binder loaded; skipping")
     
     print("Advanced binder prep complete!")
     print(f"  Num Fixed sequence positions: {len(fixed_pos_array)}")
