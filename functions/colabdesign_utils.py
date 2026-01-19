@@ -33,7 +33,7 @@ def binder_hallucination(design_name, starting_pdb, protocol, chain, target_hots
     # initialise binder hallucination model
     af_model = mk_af_model_advanced(protocol=protocol, debug=False, data_dir=advanced_settings["af_params_dir"], 
                                 use_multimer=advanced_settings["use_multimer_design"], num_recycles=advanced_settings["num_recycles_design"],
-                                best_metric='loss')
+                                best_metric='loss', diagram_cce_weight=advanced_settings.get("dgram_cce_weight", 0.1))
 
     # sanity check for hotspots
     if target_hotspot_residues == "":
@@ -931,6 +931,7 @@ class mk_af_model_advanced(mk_af_model):
                  use_templates=False,
                  debug=False,
                  data_dir=".",
+                 diagram_cce_weight=0.1,
                  **kwargs):
         
         # Validate protocol - add our new one to allowed protocols
@@ -945,6 +946,7 @@ class mk_af_model_advanced(mk_af_model):
                            use_templates=use_templates,
                            debug=debug,
                            data_dir=data_dir,
+                           #diagram_cce_weight=diagram_cce_weight,
                            **kwargs)
             
             # Override the protocol name
@@ -963,6 +965,7 @@ class mk_af_model_advanced(mk_af_model):
                                              rm_target_seq=False,
                                              rm_target_sc=False,
                                              ignore_missing=True,
+                                             diagram_cce_weight=diagram_cce_weight,
                                              **method_kwargs):
                 """Bound method wrapper for prep_binder_advanced"""
                 return prep_binder_advanced(
@@ -978,6 +981,7 @@ class mk_af_model_advanced(mk_af_model):
                     rm_target_seq=rm_target_seq,
                     rm_target_sc=rm_target_sc,
                     ignore_missing=ignore_missing,
+                    diagram_cce_weight=diagram_cce_weight,
                     **method_kwargs
                 )
             
@@ -994,6 +998,7 @@ class mk_af_model_advanced(mk_af_model):
                            use_templates=use_templates,
                            debug=debug,
                            data_dir=data_dir,
+                        #diagram_cce_weight=diagram_cce_weight,
                            **kwargs)
 
     def _binder_offset(self, sequence_length):
@@ -1245,6 +1250,7 @@ def prep_binder_advanced(af_model, pdb_filename,
                         rm_target_sc=False,
                         ignore_missing=True,
                         seed=None,
+                        diagram_cce_weight=0.1,
                         **kwargs):
     """
     Advanced binder prep with fine-grained positional control.
@@ -1367,7 +1373,7 @@ def prep_binder_advanced(af_model, pdb_filename,
         # REDESIGN MODE: Extract existing binder sequence
         af_model._wt_aatype = af_model._pdb["batch"]["aatype"][af_model._target_len:]
         af_model.opt["weights"].update({
-            "dgram_cce": 0.1,
+            "dgram_cce": diagram_cce_weight,
             "rmsd": 0.0,
             "fape": 0.0,
             "con": 0.0,
@@ -1422,6 +1428,7 @@ def prep_binder_advanced(af_model, pdb_filename,
             prefixed = ','.join([
                 f"{binder_chain}{item}" for item in pos_string.split(',')
             ])
+            # print(f"In parse_binder_positions: prefixed positions = {prefixed}, idx = {af_model._pdb['idx']}")
             pos_dict = prep_pos(prefixed, **af_model._pdb["idx"])
             pos_global = pos_dict["pos"]
             # Convert to binder-local (0-based)

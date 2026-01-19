@@ -521,6 +521,9 @@ def main():
             trajectory_n += 1
             continue
 
+        if debug:
+            print(f"length: {length}, ds_pairs (0-based): {ds_pairs}")
+
         print(f"Starting trajectory: {design_name}")
         trajectory = binder_hallucination(design_name, starting_pdb_runtime, target_settings.get("protocol", "binder"), target_settings["chains"],
                                            target_settings.get("target_hotspot_residues", None), target_settings.get("pos", None), length, seed, ds_pairs, helicity_value,
