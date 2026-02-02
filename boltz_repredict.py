@@ -136,6 +136,7 @@ def parse_results(boltz_out_dir, csv_path, structures_dir):
 def main():
     parser = argparse.ArgumentParser(description="Boltz-1 Reprediction Pipeline")
     parser.add_argument("--settings", "-s", required=True, help="Path to settings.json")
+    parser.add_argument("--design_path", "-d", default=None, help="Optional override for design_path in settings.json")
     
   
     args = parser.parse_args()
@@ -145,6 +146,9 @@ def main():
         settings = json.load(f)
 
     # Map settings to variables
+    
+    if args.design_path is not None:
+        settings["design_path"] = args.design_path
     
     base_design_path = Path(settings["design_path"])
     input_pdbs_dir = base_design_path / "Trajectory" 
