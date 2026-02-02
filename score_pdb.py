@@ -344,6 +344,8 @@ def main():
                 interface_scores, interface_AA, interface_residues = score_interface(str(pdb_path), binder_chain)
                 alpha, beta, loops, alpha_interface, beta_interface, loops_interface, i_plddt, ss_plddt = calc_ss_percentage(str(pdb_path), advanced_settings, binder_chain)
                 target_rmsd = target_pdb_rmsd(str(pdb_path), target_settings["starting_pdb"], target_settings["chains"])
+                # New: align PDBs before calculating hotspot RMSD
+                align_pdbs(str(trajectory_pdb), str(pdb_path), binder_chain, binder_chain)
                 hotspot_rmsd = (
                     unaligned_rmsd(str(trajectory_pdb), str(pdb_path), binder_chain, binder_chain)
                     if trajectory_pdb is not None
