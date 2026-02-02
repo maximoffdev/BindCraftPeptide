@@ -240,12 +240,16 @@ def main():
     parser.add_argument("--filters", "-f", default="./settings_filters/default_filters.json", help="Path to filters.json")
     parser.add_argument("--advanced", "-a", default="./settings_advanced/default_4stage_multimer.json", help="Path to advanced settings json")
     parser.add_argument("--prefilters", "-p", default=None, help="Optional prefilters json for trajectory pre-filtering")
+    parser.add_argument("--design_path", "-d", default=None, help="Optional override for design_path in settings.json")
     args = parser.parse_args()
 
     settings_path, filters_path, advanced_path, prefilters_path = perform_input_check(args)
     target_settings, advanced_settings, filters, prefilters = load_json_settings(settings_path, filters_path, advanced_path, prefilters_path)
 
     debug = target_settings.get("debug_mode", False)
+
+    if args.design_path is not None:
+        target_settings["design_path"] = args.design_path
 
     # Preserve unshifted base specs for binder_advanced so runtime shifting doesn't compound across trajectories.
     # Prefer specs provided in settings.json; fall back to advanced.json for backward compatibility.
