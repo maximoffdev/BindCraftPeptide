@@ -173,10 +173,9 @@ def load_boltz_repredict_stats(design_path: Path):
                 design_base = raw_name
                 model_num = None
 
-            stats = {
-                k: (raw_name if k == name_key else _safe_float(v))
-                for k, v in row.items()
-            }
+            # Keep only numeric-like columns; exclude the design/name column to avoid
+            # downstream averaging code attempting to sum strings.
+            stats = {k: _safe_float(v) for k, v in row.items() if k != name_key}
 
             # Map boltz naming onto BindCraft's expected complex keys where possible
             mapped = {
