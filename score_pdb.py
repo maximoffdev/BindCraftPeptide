@@ -181,12 +181,15 @@ def main():
     parser.add_argument("--input-pdbs", default=None, help="Optional directory to scan for PDBs; defaults to design_path/Repredicted")
     parser.add_argument("--relax", action="store_true", help="Relax complex PDBs into Relaxed/ before scoring")
     parser.add_argument("--use_disulfide", action="store_true", help="Enable disulfide mode during relaxation")
+    parser.add_argument("--design_path", "-d", default=None, help="Optional override for design_path in settings.json")
     args = parser.parse_args()
 
     settings_path, filters_path, advanced_path, prefilters_path = perform_input_check(args)
     target_settings, advanced_settings, filters, prefilters = load_json_settings(settings_path, filters_path, advanced_path, prefilters_path)
     binder_chain = target_settings.get("binder_chain", "B")
     target_settings["binder_chain"] = binder_chain
+    if args.design_path is not None:
+        target_settings["design_path"] = args.design_path
 
     bindcraft_folder = os.path.dirname(os.path.realpath(__file__))
     advanced_settings = perform_advanced_settings_check(advanced_settings, bindcraft_folder)
