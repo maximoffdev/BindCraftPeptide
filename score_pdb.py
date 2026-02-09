@@ -59,19 +59,26 @@ def infer_single_disulfide_pair_from_binder_sequence(binder_seq: str):
     return [(cys_positions[0], cys_positions[1])]
 
 
-_MODEL_RE = re.compile(r"^(?P<base>.+)_model(?P<model>\d+)$")
+_MODEL_RE = re.compile(r"^(?P<base>.+)_model_?(?P<model>\d+)$")
 
 
 def parse_design_and_model(pdb_path: Path):
-    """Return (design_name, model_number) from a *_modelN.pdb name.
+    """Return (design_name, model_number) from a *_modelN.pdb or *_model_N.pdb name.
 
     If the file does not match the pattern, model_number is set to 1.
+
+    Some pipelines produce 0-indexed model suffixes (e.g. *_model_0.pdb). These are
+    mapped to model_number=1 to keep BindCraft's [1..5] model convention.
     """
     stem = pdb_path.stem
     match = _MODEL_RE.match(stem)
     if not match:
         return stem, 1
-    return match.group("base"), int(match.group("model"))
+    base = match.group("base")
+    model_num = int(match.group("model"))
+    if model_num == 0:
+        model_num = 1
+    return base, model_num
 
 
 def trajectory_name_from_design(design_name: str):
@@ -132,6 +139,8 @@ def load_boltz_repredict_stats(design_path: Path):
     If the CSV's design_name includes a *_modelN suffix, it is parsed and stored under that model.
     Otherwise it is stored under model None.
     """
+    # Normalize in case caller passes a relative path but SLURM changes CWD.
+    design_path = Path(design_path).expanduser().resolve(strict=False)
     print(f"Looking for boltz_repredict_stats.csv under {design_path}")
     boltz_csv = design_path / "boltz_repredict_stats.csv"
     if not boltz_csv.exists():
@@ -140,8 +149,19 @@ def load_boltz_repredict_stats(design_path: Path):
     by_design_model = {}
     with boltz_csv.open("r", newline="") as handle:
         reader = csv.DictReader(handle)
+        # Support common header variants seen in boltz outputs.
+        name_keys = ["design_name", "Design", "design", "name", "Name"]
+        name_key = None
+        for k in name_keys:
+            if reader.fieldnames and k in reader.fieldnames:
+                name_key = k
+                break
+        if name_key is None:
+            # Fallback to the first column name if present.
+            name_key = reader.fieldnames[0] if reader.fieldnames else "design_name"
+
         for row in reader:
-            raw_name = (row.get("design_name") or "").strip()
+            raw_name = (row.get(name_key) or "").strip()
             if not raw_name:
                 continue
 
@@ -153,7 +173,10 @@ def load_boltz_repredict_stats(design_path: Path):
                 design_base = raw_name
                 model_num = None
 
-            stats = {k: _safe_float(v) if k != "design_name" else raw_name for k, v in row.items()}
+            stats = {
+                k: (raw_name if k == name_key else _safe_float(v))
+                for k, v in row.items()
+            }
 
             # Map boltz naming onto BindCraft's expected complex keys where possible
             mapped = {
@@ -192,6 +215,9 @@ def main():
     if args.design_path is not None:
         target_settings["design_path"] = args.design_path
         print(f"Overriding design_path with CLI argument: {target_settings['design_path']}")
+
+    # Make design_path absolute to be resilient to SLURM/launcher changing CWD.
+    target_settings["design_path"] = str(Path(target_settings["design_path"]).expanduser().resolve(strict=False))
 
     bindcraft_folder = os.path.dirname(os.path.realpath(__file__))
     advanced_settings = perform_advanced_settings_check(advanced_settings, bindcraft_folder)
@@ -295,7 +321,7 @@ def main():
 
     helicity_value = load_helicity(advanced_settings)
     seed = 0
-    design_path = Path(target_settings["design_path"])
+    design_path = Path(target_settings["design_path"]).expanduser().resolve(strict=False)
     boltz_stats_by_design_model = load_boltz_repredict_stats(design_path)
     if boltz_stats_by_design_model:
         print(f"Loaded boltz repredict stats from {design_path / 'boltz_repredict_stats.csv'}")
@@ -349,13 +375,11 @@ def main():
                 interface_scores, interface_AA, interface_residues = score_interface(str(pdb_path), binder_chain)
                 alpha, beta, loops, alpha_interface, beta_interface, loops_interface, i_plddt, ss_plddt = calc_ss_percentage(str(pdb_path), advanced_settings, binder_chain)
                 target_rmsd = target_pdb_rmsd(str(pdb_path), target_settings["starting_pdb"], target_settings["chains"])
-                # New: align PDBs before calculating hotspot RMSD
-                align_pdbs(str(trajectory_pdb), str(pdb_path), binder_chain, binder_chain)
-                hotspot_rmsd = (
-                    unaligned_rmsd(str(trajectory_pdb), str(pdb_path), binder_chain, binder_chain)
-                    if trajectory_pdb is not None
-                    else None
-                )
+                hotspot_rmsd = None
+                if trajectory_pdb is not None:
+                    # Align PDBs before calculating hotspot RMSD.
+                    align_pdbs(str(trajectory_pdb), str(pdb_path), binder_chain, binder_chain)
+                    hotspot_rmsd = unaligned_rmsd(str(trajectory_pdb), str(pdb_path), binder_chain, binder_chain)
 
                 if not interface_residues_for_row:
                     interface_residues_for_row = interface_residues
