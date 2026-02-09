@@ -132,6 +132,7 @@ def load_boltz_repredict_stats(design_path: Path):
     If the CSV's design_name includes a *_modelN suffix, it is parsed and stored under that model.
     Otherwise it is stored under model None.
     """
+    print(f"Looking for boltz_repredict_stats.csv under {design_path}")
     boltz_csv = design_path / "boltz_repredict_stats.csv"
     if not boltz_csv.exists():
         return {}
@@ -190,6 +191,7 @@ def main():
     target_settings["binder_chain"] = binder_chain
     if args.design_path is not None:
         target_settings["design_path"] = args.design_path
+        print(f"Overriding design_path with CLI argument: {target_settings['design_path']}")
 
     bindcraft_folder = os.path.dirname(os.path.realpath(__file__))
     advanced_settings = perform_advanced_settings_check(advanced_settings, bindcraft_folder)
