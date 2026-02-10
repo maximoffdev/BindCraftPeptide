@@ -27,20 +27,43 @@ def get_sequence_from_pdb(pdb_path, chain_id):
         print(f"Error parsing {pdb_path}: {e}")
     return None
 
-def create_boltz_yaml(output_path, target_seq, binder_seq, auto_disulfide, is_cyclic):
-    """Generates a Boltz-1 YAML with optional cyclic and covalent constraints."""
+def create_boltz_yaml(
+    output_path,
+    target_seq,
+    binder_seq,
+    auto_disulfide,
+    is_cyclic,
+    template_pdb_path,
+):
+    """Generates a Boltz-1 YAML with optional cyclic and covalent constraints.
+
+    A template for chain A is ALWAYS included (forced) using the provided template PDB.
+    """
     disulf_res = []
     if auto_disulfide:
         for index, aa in enumerate(binder_seq):
             if aa == "C":
                 disulf_res.append(index + 1)
+
+    template_pdb_path = Path(template_pdb_path).expanduser().resolve()
+    if not template_pdb_path.exists():
+        raise FileNotFoundError(f"Template PDB does not exist: {template_pdb_path}")
     
     manifest = {
         "version": 1,
         "sequences": [
             {"protein": {"id": "A", "sequence": target_seq, "msa": "empty"}},
             {"protein": {"id": "B", "sequence": binder_seq, "msa": "empty", "cyclic": is_cyclic}}
-        ]
+        ],
+        # Always enforce chain A as template
+        "templates": [
+            {
+                "pdb": str(template_pdb_path),
+                "chain_id": ["A"],
+                "template_id": ["A"],
+                "force": True,
+            }
+        ],
     }
         
     if len(disulf_res) == 2:
@@ -175,13 +198,7 @@ def main():
     #Process PDBs and Fastas from input dirs
 
     pdb_files = list(input_pdbs_dir.glob("*.pdb"))
-    if not pdb_files:
-        print(f"No PDBs found in {input_pdbs_dir}")
-        return
-    
     fasta_files = list(input_fastas_dir.glob("*.fasta"))
-    if not fasta_files:
-        print(f"No FASTA files found in {input_fastas_dir}")
         
     
     if settings["disulfide_num"] == 1:
@@ -190,31 +207,50 @@ def main():
         use_disulfide = False
 
     # Creating Boltz input yamls
-    for pdb in pdb_files:
-        name = pdb.stem
-        t_seq = get_sequence_from_pdb(pdb, target_chain)
-        b_seq = get_sequence_from_pdb(pdb, binder_chain)
+    if pdb_files:
+        for pdb in pdb_files:
+            name = pdb.stem
+            t_seq = get_sequence_from_pdb(pdb, target_chain)
+            b_seq = get_sequence_from_pdb(pdb, binder_chain)
 
-        if t_seq and b_seq:
-            create_boltz_yaml(
-                yaml_dir / f"{name}.yaml",
-                t_seq, b_seq,use_disulfide, cyclic
-            )
+            if t_seq and b_seq:
+                create_boltz_yaml(
+                    yaml_dir / f"{name}.yaml",
+                    t_seq,
+                    b_seq,
+                    use_disulfide,
+                    cyclic,
+                    template_pdb_path=pdb,
+                )
+    else:
+        if not fasta_files:
+            print(f"No PDBs found in {input_pdbs_dir} and no FASTA files found in {input_fastas_dir}")
+            return
 
-    for fasta in fasta_files:
-        name = fasta.stem.replace("_complete","")
-        with open(fasta, 'r') as f:
-            lines = f.readlines()
-            seq = "".join([line.strip() for line in lines if not line.startswith(">")])
-            t_seq = seq.split("/")[0]
-            b_seq = seq.split("/")[1]
-         
-           
-        if t_seq and b_seq:
-            create_boltz_yaml(
-                yaml_dir / f"{name}.yaml",
-                t_seq, b_seq, use_disulfide, cyclic
-            )
+        for fasta in fasta_files:
+            name = fasta.stem.replace("_complete", "")
+            with open(fasta, 'r') as f:
+                lines = f.readlines()
+                seq = "".join([line.strip() for line in lines if not line.startswith(">")])
+                t_seq = seq.split("/")[0]
+                b_seq = seq.split("/")[1]
+
+            if t_seq and b_seq:
+                template_pdb = input_pdbs_dir / f"{name}.pdb"
+                if not template_pdb.exists():
+                    print(
+                        f"[WARN] Skipping FASTA '{fasta.name}' because required template PDB was not found: {template_pdb}"
+                    )
+                    continue
+
+                create_boltz_yaml(
+                    yaml_dir / f"{name}.yaml",
+                    t_seq,
+                    b_seq,
+                    use_disulfide,
+                    cyclic,
+                    template_pdb_path=template_pdb,
+                )
 
 
 
