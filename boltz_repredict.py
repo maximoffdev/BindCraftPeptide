@@ -59,9 +59,10 @@ def create_boltz_yaml(
         "templates": [
             {
                 "pdb": str(template_pdb_path),
-                "chain_id": ["A"],
-                "template_id": ["A"],
+                # "chain_id": ["A"],
+                # "template_id": ["A"],
                 "force": True,
+                "threshold": 2.0,
             }
         ],
     }
