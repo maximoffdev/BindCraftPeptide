@@ -19,6 +19,72 @@ from pyrosetta.rosetta.protocols.rosetta_scripts import XmlObjects
 from .generic_utils import clean_pdb
 from .biopython_utils import hotspot_residues
 
+################################################################################################
+
+
+import re
+from pathlib import Path
+
+def collect_pdbs(scan_root: Path):
+    """Collect PDBs under scan_root.
+
+    If a Relaxed subfolder exists (or any file lives under Relaxed), prefer only Relaxed PDBs.
+    Excludes Binder/ and Best/ by default to keep only complex predictions.
+    """
+    if not scan_root.exists():
+        return []
+
+    pdbs = sorted(scan_root.rglob("*.pdb"))
+    if not pdbs:
+        return []
+
+    relaxed = [p for p in pdbs if "Relaxed" in p.parts]
+    if relaxed:
+        # Prefer Relaxed PDBs, but keep unrelaxed ones that don't have a relaxed counterpart.
+        relaxed_by_name = {p.name: p for p in relaxed}
+        unrelaxed = [p for p in pdbs if "Relaxed" not in p.parts]
+        unrelaxed_without_relaxed_copy = [p for p in unrelaxed if p.name not in relaxed_by_name]
+        pdbs = list(relaxed) + unrelaxed_without_relaxed_copy
+
+    pdbs = [p for p in pdbs if "Binder" not in p.parts and "Best" not in p.parts]
+    return pdbs
+
+
+
+#Utils used in  the rescoreing of boltz repredicted structures after design
+def parse_design_and_model(pdb_path: Path):
+    """Return (design_name, model_number) from a *_modelN.pdb name.
+
+    If the file does not match the pattern, model_number is set to 1.
+    """
+    stem = pdb_path.stem
+    match = _MODEL_RE.match(stem)
+    if not match:
+        return stem, 1
+    return match.group("base"), int(match.group("model"))
+
+
+
+def infer_single_disulfide_pair_from_binder_sequence(binder_seq: str):
+    """Infer a single disulfide pair from binder sequence.
+
+    Assumption (per workflow simplification): exactly two cysteines exist in every binder
+    and they should be stapled together.
+
+    Returns a list of one tuple with 0-based binder-local indices, or None if not possible.
+    """
+    cys_positions = [i for i, aa in enumerate(binder_seq) if aa == "C"]
+    if len(cys_positions) != 2:
+        return None
+    return [(cys_positions[0], cys_positions[1])]
+
+
+_MODEL_RE = re.compile(r"^(?P<base>.+)_model(?P<model>\d+)$")
+
+
+
+################################################################################################
+
 # Rosetta interface scores
 def score_interface(pdb_file, binder_chain="B"):
     # load pose
@@ -58,7 +124,7 @@ def score_interface(pdb_file, binder_chain="B"):
     # Convert the list into a comma-separated string
     interface_residues_pdb_ids_str = ','.join(interface_residues_pdb_ids)
 
-    # Calculate the percentage of hydrophobic residues at the interface of the binder
+    #  the percentage of hydrophobic residues at the interface of the binder
     hydrophobic_aa = set('ACFILMPVWY')
     hydrophobic_count = sum(interface_AA[aa] for aa in hydrophobic_aa)
     if interface_nres != 0:
@@ -84,7 +150,7 @@ def score_interface(pdb_file, binder_chain="B"):
         interface_hbond_percentage = None
         interface_bunsch_percentage = None
 
-    # calculate binder energy score
+    #  binder energy score
     chain_design = ChainSelector(binder_chain)
     tem = pr.rosetta.core.simple_metrics.metrics.TotalEnergyMetric()
     tem.set_scorefunction(scorefxn)

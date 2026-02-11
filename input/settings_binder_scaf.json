@@ -1,0 +1,9 @@
+{
+    "design_path": "output_peptide_adj",
+    "binder_name": "peptide",
+    "starting_pdb": "../input/4tuj_renum_maxi2.pdb",
+    "chains": "A",
+    "target_hotspot_residues": "A49,A100,A163",
+    "lengths": [8, 15],
+    "number_of_final_designs": 1000
+}

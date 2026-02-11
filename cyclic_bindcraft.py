@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Design pipeline: AF2 design + optional MPNN redesign.
-Outputs trajectory PDBs and metrics CSVs (trajectory_stats.csv, mpnn_design_stats.csv, AF2_design_stats.csv, final_design_stats.csv, failure_csv.csv).
-This is a split-out version of the original bindcraft.py focused on the design stage only.
+"""Design pipeline: Includes the Alphafold2 design part, prefiltering for clashes, followed by ProteinMPNN sequence design. 
+All sequences of a design trajectory are predicted as one Batch using Boltz2 with optional covalent constraints. 
+The Repredicted Structures are relaxed and scored using PyRosetta and finally filtered based on the Boltz2 and Rosetta scores. 
+The design loop continues until the specified number of accepted designs or maximum number of trajectories is reached.
 """
 import os
 import sys
@@ -9,10 +10,13 @@ import argparse
 import time
 import copy
 import tempfile
+import pandas as pd
+import csv
 from Bio import PDB
 import numpy as np
 from functions import *
-
+from pathlib import Path
+import yaml
 
 def _safe_remove(path: str, debug: bool = False):
     """Remove a file if it exists; never crash the pipeline due to cleanup."""
@@ -323,7 +327,10 @@ def main():
 
     script_start_time = time.time()
     trajectory_n = 1
-    accepted_designs = 0
+
+
+    design_path = Path(target_settings["design_path"])
+    
 
     # Optional starting PDB helix check
     if advanced_settings.get("initial_helix_check_cutoff", 100.0) < 100.0:
@@ -340,7 +347,25 @@ def main():
             sys.exit(1)
         print(f"Starting binder secondary structure check passed: {sheet_pct}% sheet, {loop_pct}% loop")
 
+
+
+
+# Begin of the Design Loop
+
+
     while True:
+
+        #Check if number of accepted designs or number of trajectories are reached
+
+        path = os.path.join(design_path, 'Accepted')
+        
+        if os.path.exists(path):
+            n_accepted_designs = len([name for name in os.listdir(path) if os.path.isfile(os.path.join(path, name))])
+            
+            if n_accepted_designs >= target_settings.get('number_of_final_designs', 100):
+                print(f"Target number of accepted designs reached! Found {n_accepted_designs} accepted designs. Stopping...")
+                break
+        #Check if the maximum number of trajectories is reached
 
         if check_n_trajectories(design_paths, advanced_settings):
             break
@@ -521,8 +546,7 @@ def main():
             trajectory_n += 1
             continue
 
-        if debug:
-            print(f"length: {length}, ds_pairs (0-based): {ds_pairs}")
+        # AF2 design trajectory
 
         print(f"Starting trajectory: {design_name}")
         trajectory = binder_hallucination(design_name, starting_pdb_runtime, target_settings.get("protocol", "binder"), target_settings["chains"],
@@ -707,17 +731,338 @@ def main():
 
 
 
+    #check if a trajectory has a succesful design, if yes run boltz reprediction on that design
+        if not trajectory.aux["log"].get("terminate", "") == "":
+            print(f"Starting new Trajectory")
+            continue
+
+
+   #  Setup paths correctly using Pathlib --> one dir for each trajectory so boltz is loaded only one per tracetory
+        
+        fasta_dir = design_path / "trajectory_fastas"
+        boltz_out_dir = design_path / "boltz_reprediction" / design_name
+        boltz_templates_dir = design_path / "boltz_reprediction" / "templates"
+        boltz_out_dir.mkdir(parents=True, exist_ok=True)
+        boltz_templates_dir.mkdir(parents=True, exist_ok=True)
+
+
+        # Initialize variables
+        auto_disulfide = (target_settings.get('disulfide_num') == 1)
+        fasta_found_for_design = False
+
+        design_struct = design_path / "Trajectory" / f"{design_name}.pdb"
+        # 2. Check for FASTAs
+        if fasta_dir.exists():
+            fasta_files = list(fasta_dir.glob('*.fasta'))
+            for fasta_path in fasta_files:
+                if design_name in fasta_path.name:
+                    fasta_found_for_design = True
+                    
+                    # Read the file content to get sequences
+                    with open(fasta_path, 'r') as f:
+                        # Skip header, join lines, split by '/'
+                        content = "".join([line.strip() for line in f if not line.startswith(">")])
+                        
+                        if '/' in content:
+                            target_seq, binder_seq = content.split('/')
+                            
+                            yaml_name = fasta_path.stem + ".yaml"
+                            create_boltz_yaml(boltz_out_dir / yaml_name, target_seq, binder_seq, auto_disulfide, False, target_settings.get("use_template", False), design_struct,boltz_templates_dir)
+
+        # 3. Fallback to PDB if no FASTAs were matched for this specific design
+        if not fasta_found_for_design:
+            design_struct = design_path / "Trajectory" / f"{design_name}.pdb"
+            
+            if design_struct.exists():
+                target_seq = extract_chain_sequence_from_pdb(str(design_struct), "A")
+                binder_seq = extract_chain_sequence_from_pdb(str(design_struct), "B")
+                
+                yaml_name = f"{design_name}.yaml"
+
+                create_boltz_yaml(boltz_out_dir / yaml_name, target_seq, binder_seq, auto_disulfide, False, target_settings.get("use_template", False), design_struct, boltz_templates_dir)
+
+        # Run Boltz reprediction for this design and all mpnn sequences in one batch
+        conda_env = target_settings.get("boltz_conda_env", "boltz")
+        print(f'Running Boltz repredictions for design: {design_name}')
+        run_boltz(design_path / "boltz_reprediction" / design_name, design_path / "boltz_reprediction" / 'predictions', conda_env)
+        
+       
+        print(f'Reprediction finished. Parsing results for: {design_name}')
         
 
+        parse_results( 
+            design_path / "boltz_reprediction" / "predictions" / f"boltz_results_{design_name}", 
+            design_path / "boltz_repredicted_stats.csv", 
+            design_path / "Repredicted",
+            extract_chain_sequence_from_pdb
+        )
+
+        #Boltz Reprediction finished --> PyRosetta Relaxation and Scoring of Boltz outputs
+
+        # --- PyRosetta Initialization ---
+        _has_is_init = hasattr(pr, "is_initialized")
+        try:
+            if not _has_is_init or not pr.is_initialized():
+                pr.init(f'-ignore_unrecognized_res -ignore_zero_occupancy -mute all -holes:dalphaball {advanced_settings["dalphaball_path"]} -corrections::beta_nov16 true -relax:default_repeats 1')
+        except AttributeError:
+            pr.init(f'-ignore_unrecognized_res -ignore_zero_occupancy -mute all -holes:dalphaball {advanced_settings["dalphaball_path"]} -corrections::beta_nov16 true -relax:default_repeats 1')
+
+        # --- Relaxation Phase ---
+        # Collecting all unrelaxed PDBs for this design's Boltz reprediction outputs based on naming convention, to relax them in batch. 
+        unrelaxed_pdbs = list((design_path / "Repredicted").glob(f"*{design_name}*.pdb"))
+        print(f"Found {len(unrelaxed_pdbs)} unrelaxed complex PDB(s) for Trajectory {design_name} to relax")
+        
+        disulfide_enabled = (target_settings.get('disulfide_num') == 1)
+        relaxed_dir = design_path / 'Repredicted' / "Relaxed"
+        relaxed_dir.mkdir(parents=True, exist_ok=True)
+
+        for unrelaxed_pdb in unrelaxed_pdbs:
+            design_base, model_num = parse_design_and_model(unrelaxed_pdb)
+            out_relaxed = relaxed_dir / f"{design_base}_model{model_num}.pdb"
+            
+            if out_relaxed.exists():
+                continue
+                
+            print(f"Relaxing {unrelaxed_pdb.name} -> {out_relaxed.name}")
+            
+            pairs = None
+            disulfide_for_this = False
+            if disulfide_enabled:
+                try:
+                    binder_seq = extract_chain_sequence_from_pdb(str(unrelaxed_pdb), binder_chain)
+                    pairs = infer_single_disulfide_pair_from_binder_sequence(binder_seq)
+                    if pairs:
+                        disulfide_for_this = True
+                except Exception as exc:
+                    print(f"Warning: skipping relaxation for {unrelaxed_pdb.name} due to disulfide error: {exc}")
+                    continue
+
+            try:
+                pr_relax(
+                    str(unrelaxed_pdb),
+                    str(out_relaxed),
+                    disulfide=disulfide_for_this,
+                    binder_chain=binder_chain,
+                    binder_local_pairs=pairs,
+                )
+            except Exception as exc:
+                print(f"Warning: skipping relaxation for {unrelaxed_pdb.name}: {exc}")
+                continue
+
+        # --- Scoring Phase ---
+        #Collect all relaxed PDBs for this trajectory 
+
+        relaxed_pdbs = list(relaxed_dir.glob(f"*{design_name}*.pdb"))
+        if not relaxed_pdbs:
+            print(f"No relaxed PDBs found for {design_name}; skipping scoring.")
+            continue
+
+        # Map models to paths for iteration
 
 
+
+
+
+        model_map = {}
+        for rp in relaxed_pdbs:
+            _, m_num = parse_design_and_model(rp)
+            model_map[m_num] = rp
+        
+        model_nums = sorted(model_map.keys())
+        print(f"Scoring {design_name} from {len(model_nums)} model PDB(s)")
+
+        helicity_value = load_helicity(advanced_settings)
+        
+        try:
+            # Use the first available model to get the primary sequence
+            primary_pdb = model_map[model_nums[0]]
+            binder_seq = extract_chain_sequence_from_pdb(str(primary_pdb), binder_chain)
+        except Exception as exc:
+            print(f"Skipping {design_name} sequence extraction: {exc}")
+            continue
+
+        length = len(binder_seq)
+        trajectory_pdb = design_path / "Trajectory" / f"{design_name}.pdb"
+        if not trajectory_pdb.exists(): trajectory_pdb = None
+
+        complex_statistics = {}
+        interface_residues_for_row = ""
+        
+
+        
+        df = pd.read_csv(str(design_path/"boltz_repredicted_stats.csv"))
+
+        #Iterate over the just relaxed PDBs to calculate scores and compile statistics for each model, then merge with the original design metrics and write to final CSV
+        for pdb_path  in relaxed_pdbs:
+
+           
+            print ('the for loop begins here!')
+            print('An the relexed pdbs are:', relaxed_pdbs)
+            try:
+                
+                unrelaxed_candidate = design_path / "Repredicted" / pdb_path.name
+                
+                num_clashes_unrelaxed = calculate_clash_score(str(unrelaxed_candidate)) if unrelaxed_candidate.exists() else None
+                num_clashes_relaxed = calculate_clash_score(str(pdb_path))
+                
+                interface_scores, interface_AA, interface_residues = score_interface(str(pdb_path), binder_chain)
+                alpha, beta, loops, alpha_interface, beta_interface, loops_interface, i_plddt, ss_plddt = calc_ss_percentage(str(pdb_path), advanced_settings, binder_chain)
+                
+                target_rmsd = target_pdb_rmsd(str(pdb_path), target_settings["starting_pdb"], target_settings["chains"])
+                hotspot_rmsd = unaligned_rmsd(str(trajectory_pdb), str(pdb_path), binder_chain, binder_chain) if trajectory_pdb else None
+
+                if not interface_residues_for_row:
+                    interface_residues_for_row = interface_residues
+
+                
+                #Extract the Boltz metrics from the currently scored design
+                row_dict = df[df['Design'].str.contains(pdb_path.stem.replace('_model1',''))].iloc[0]
+
+
+                print (f"boltzvalues for this design {str(df['Design'].iloc[0])} are: {row_dict}")
+                
+                complex_statistics = {
+                    
+                    
+                    'Unrelaxed_Clashes': num_clashes_unrelaxed,
+                    'Relaxed_Clashes': num_clashes_relaxed,
+                    'Binder_Energy_Score': interface_scores['binder_score'],
+                    'Surface_Hydrophobicity': interface_scores['surface_hydrophobicity'],
+                    'ShapeComplementarity': interface_scores['interface_sc'],
+                    'PackStat': interface_scores['interface_packstat'],
+                    'dG': interface_scores['interface_dG'],
+                    'dSASA': interface_scores['interface_dSASA'],
+                    'dG/dSASA': interface_scores['interface_dG_SASA_ratio'],
+                    'Interface_SASA_%': interface_scores['interface_fraction'],
+                    'Interface_Hydrophobicity': interface_scores['interface_hydrophobicity'],
+                    'n_InterfaceResidues': interface_scores['interface_nres'],
+                    'n_InterfaceHbonds': interface_scores['interface_interface_hbonds'],
+                    'InterfaceHbondsPercentage': interface_scores['interface_hbond_percentage'],
+                    'n_InterfaceUnsatHbonds': interface_scores['interface_delta_unsat_hbonds'],
+                    'InterfaceUnsatHbondsPercentage': interface_scores['interface_delta_unsat_hbonds_percentage'],
+                    'InterfaceAAs': interface_AA,
+                    'Interface_Helix%': alpha_interface,
+                    'Interface_BetaSheet%': beta_interface,
+                    'Interface_Loop%': loops_interface,
+                    'Binder_Helix%': alpha,
+                    'Binder_BetaSheet%': beta,
+                    'Binder_Loop%': loops,
+                    'Hotspot_RMSD': hotspot_rmsd,
+                    'Target_RMSD': target_rmsd,
+                    'Algorithm': advanced_settings.get("design_algorithm"),
+                    'Lenght':len(row_dict['binder_sequence']),
+                    'Target_Hotspots':target_settings.get("target_hotspot_residues", "")
+
+                }
+                complex_statistics
+
+               
+
+                combined_row = {**row_dict, **complex_statistics}
+                print (f'This is the combined metric for {pdb_path.name}: {combined_row}')
+               
+
+
+
+
+                
+                # Convert the interface dict  to a string so it doesn't break the formatting.
+                if 'InterfaceAAs' in combined_row:
+                    combined_row['InterfaceAAs'] = str(combined_row['InterfaceAAs'])
+
+                # Write resutls
+                output_path = f"{design_path}/final_results.csv"
+                file_exists = os.path.isfile(output_path)
+
+                with open(output_path, 'a', newline='') as f:
+                    # We use the keys of our combined dictionary as the header
+                    writer = csv.DictWriter(f, fieldnames=combined_row.keys())
+                    
+                    # Write the header only if we are creating the file for the first time
+                    if not file_exists:
+                        writer.writeheader()
+                        
+                    writer.writerow(combined_row)
+
+
+                print(f"Successfully merged and appended stats for {design_name} to {output_path}")
+                print (f"This is the complex statistics for {pdb_path}: ", complex_statistics)
+
+            except Exception as exc:
+                print(f"Error scoring {design_name} model {model_num}: {exc}")
+                continue
+
+
+
+
+            #Starting the filtering and folder organization for this model's results
+            metric_filter = list(filters.keys())
+
+             #Filter this exact row:
+            passed = True
+            failed_filters_list = []
+            try:
+                for metric in metric_filter:
+                    if metric not in combined_row:
+                        continue
+                        
+                    threshold_val = filters[metric].get("threshold")
+                    higher_is_better = filters[metric].get("higher")
+
+                    if threshold_val is None or threshold_val == 'null':
+                        continue
+
+                    current_val = combined_row[metric]
+                    
+                    # Logic: If higher is better, but current is lower than threshold -> FAIL
+                    if higher_is_better:
+                        if current_val < threshold_val:
+                            passed = False
+                            failed_filters_list.append(f"{metric}({current_val}<{threshold_val})")
+                    # Logic: If lower is better, but current is higher than threshold -> FAIL
+                    else:
+                        if current_val > threshold_val:
+                            passed = False
+                            failed_filters_list.append(f"{metric}({current_val}>{threshold_val})")
+
+            except Exception as e:
+                print(f"Filter Error: {e}")
+
+            # Add the failure reasons to the row data for the folders
+            combined_row['Failed_Filters'] = ", ".join(failed_filters_list) if not passed else ""
+
+            # Write the results in the Accepted or failed dir for later analysis
+            status_folder = 'Accepted' if passed else 'Failed'
+            target_dir = design_path / status_folder
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy the PDB
+            shutil.copy(pdb_path, target_dir)
+
+            # Write the variant-specific CSV line into the folder
+            # (e.g., peptide_l14_s306443/Accepted/accepted_metrics.csv)
+            status_csv_path = target_dir / f"{status_folder.lower()}_metrics.csv"
+            status_file_exists = status_csv_path.exists() and status_csv_path.stat().st_size > 0
+
+            with open(status_csv_path, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=combined_row.keys())
+                if not status_file_exists:
+                    writer.writeheader()
+                writer.writerow(combined_row)
+
+            if passed:
+                print(f"Design {pdb_path.name} PASSED and saved to {status_folder}")
+            else:
+                print(f" Design {pdb_path.name} FAILED: {failed_filters_list}")
+
+                
+        # --- Cleanup ---
         trajectory_n += 1
         gc.collect()
 
-    elapsed_time = time.time() - script_start_time
-    elapsed_text = f"{'%d hours, %d minutes, %d seconds' % (int(elapsed_time // 3600), int((elapsed_time % 3600) // 60), int(elapsed_time % 60))}"
-    print(f"Finished all designs. Ran {trajectory_n} trajectories in {elapsed_text}")
+        # --> next design trajectory starts. 
 
+    
 
 if __name__ == "__main__":
     main()

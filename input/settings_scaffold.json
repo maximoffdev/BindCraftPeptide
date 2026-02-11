@@ -1,0 +1,11 @@
+{
+    "design_path": "peptide_scaffold_output_with_fasta",
+    "binder_name": "scaffold_peptide",
+    "starting_pdb": "./input/4tuj_fixed.pdb",
+    "protocol": "binder_advanced",
+    "chains": "A",
+    "_comment_chains": "Chain of the target; has to be chain A! (so far no working implementation for multi-chain targets)",
+    "target_hotspot_residues": "",
+    "lengths": [],
+    "number_of_final_designs": 1000
+}

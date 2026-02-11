@@ -1,0 +1,134 @@
+{
+    "boltz_confidence_score": {
+        "threshold": 0.90,
+        "higher": true
+    },
+    "boltz_pTM_complex": {
+        "threshold": 0.85,
+        "higher": true
+    },
+    "boltz_complex_pDE": {
+        "threshold": 0.5,
+        "higher": false
+    },
+    "boltz_complex_iPDE": {
+        "threshold": 0.4,
+        "higher": false
+    },
+    "boltz_ipTM_complex": {
+        "threshold": 0.85,
+        "higher": true
+    },
+    "boltz_pLDDT_complex": {
+        "threshold": 0.9,
+        "higher": true
+    },
+    "boltz_ipLDDT_complex": {
+        "threshold": 0.85,
+        "higher": true
+    },
+    "boltz_pLDDT_target": {
+        "threshold": 0.92,
+        "higher": true
+    },
+    "boltz_pLDDT_binder": {
+        "threshold": 0.8,
+        "higher": true
+    },
+    "Unrelaxed_Clashes": {
+        "threshold": null,
+        "higher": false
+    },
+    "Relaxed_Clashes": {
+        "threshold": 0,
+        "higher": false
+    },
+    "Binder_Energy_Score": {
+        "threshold": null,
+        "higher": false
+    },
+    "Surface_Hydrophobicity": {
+        "threshold": null,
+        "higher": false
+    },
+    "ShapeComplementarity": {
+        "threshold": 0.6,
+        "higher": true
+    },
+    "PackStat": {
+        "threshold": 0.6,
+        "higher": true
+    },
+    "dG": {
+        "threshold": -15.0,
+        "higher": false
+    },
+    "dSASA": {
+        "threshold": 1000.0,
+        "higher": true
+    },
+    "dG/dSASA": {
+        "threshold": -0.02,
+        "higher": false
+    },
+    "Interface_SASA_%": {
+        "threshold": null,
+        "higher": true
+    },
+    "Interface_Hydrophobicity": {
+        "threshold": null,
+        "higher": true
+    },
+    "n_InterfaceResidues": {
+        "threshold": null,
+        "higher": true
+    },
+    "n_InterfaceHbonds": {
+        "threshold": null,
+        "higher": true
+    },
+    "InterfaceHbondsPercentage": {
+        "threshold": null,
+        "higher": true
+    },
+    "n_InterfaceUnsatHbonds": {
+        "threshold": null,
+        "higher": false
+    },
+    "InterfaceUnsatHbondsPercentage": {
+        "threshold": null,
+        "higher": false
+    },
+    "Interface_Helix%": {
+        "threshold": null,
+        "higher": true
+    },
+    "Interface_BetaSheet%": {
+        "threshold": null,
+        "higher": true
+    },
+    "Interface_Loop%": {
+        "threshold": null,
+        "higher": false
+    },
+    "Binder_Helix%": {
+        "threshold": null,
+        "higher": true
+    },
+    "Binder_BetaSheet%": {
+        "threshold": null,
+        "higher": true
+    },
+    "Binder_Loop%": {
+        "threshold": null,
+        "higher": false
+    },
+    "Hotspot_RMSD": {
+        "threshold": null,
+        "higher": false
+    },
+    "Target_RMSD": {
+        "threshold": 2.0,
+        "higher": false
+    }
+}

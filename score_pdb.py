@@ -431,9 +431,40 @@ def main():
         advanced_file = os.path.basename(advanced_path).split('.')[0]
         data.extend([elapsed_text, seq_notes, settings_file, filters_file, advanced_file])
 
-        insert_data(repredict_csv, data)
+# 1. Construct the Header (only needed if the file is new)
+        headers = [
+            "Design", "Algorithm", "Length", "Seed", "Helicity", 
+            "Hotspots", "Sequence", "Interface_Residues", "Empty1", "Empty2"
+        ]
+        
+        # Add headers for complex statistics
+        for label in statistics_labels:
+            headers.append(f"{label}_Average")
+            for model in model_numbers:
+                headers.append(f"{label}_Model_{model}")
 
-    print(f"Scoring complete. Results in {repredict_csv}")
+        # Add headers for binder statistics
+        for label in ['pLDDT', 'pTM', 'pAE', 'Binder_RMSD']:
+            headers.append(f"Binder_{label}_Average")
+            for model in model_numbers:
+                headers.append(f"Binder_{label}_Model_{model}")
+
+        # Add metadata headers
+        headers.extend(["Elapsed_Time", "Sequence_Notes", "Settings_File", "Filters_File", "Advanced_File"])
+
+        # 2. Write to File (Append mode)
+        file_exists = os.path.isfile(repredict_csv)
+        
+        with open(repredict_csv, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            # If the file is brand new, write the header first
+            if not file_exists:
+                writer.writerow(headers)
+            # Append the actual data row
+            writer.writerow(data)
+        # --- End of CSV Logic ---
+
+        print(f"Scoring complete. Results in {repredict_csv}")
 
 
 if __name__ == "__main__":
