@@ -14,6 +14,68 @@ from Bio import PDB
 
 
 
+def _write_clean_template_pdb(
+    template_pdb_path: Path,
+    output_pdb_path: Path,
+    chain_id: str | None,
+) -> Path:
+    """Write a cleaned template PDB to avoid Boltz template parsing crashes.
+
+    The cleaning is intentionally conservative:
+    - Keep only ATOM records
+    - Keep only standard amino-acid residues
+    - Optionally keep only a single chain
+    - Renumber residues sequentially starting at 1 (removes insertion-code weirdness)
+
+    Boltz's template parser can crash on some PDBs that contain non-standard residues,
+    insertion codes, or mixed polymer records. Providing a minimal single-chain template
+    is typically sufficient and more robust.
+    """
+
+    template_pdb_path = Path(template_pdb_path).expanduser().resolve()
+    output_pdb_path = Path(output_pdb_path).expanduser().resolve()
+    output_pdb_path.parent.mkdir(parents=True, exist_ok=True)
+
+    parser = PDB.PDBParser(QUIET=True)
+    structure = parser.get_structure("template", str(template_pdb_path))
+    model = next(structure.get_models())
+
+    if chain_id is not None and chain_id not in [c.id for c in model.get_chains()]:
+        raise ValueError(
+            f"Requested template chain '{chain_id}' not found in {template_pdb_path}"
+        )
+
+    # Renumber residues in-place (on the parsed structure) for the selected chain(s).
+    for chain in model.get_chains():
+        if chain_id is not None and chain.id != chain_id:
+            continue
+
+        new_resseq = 1
+        for residue in list(chain.get_residues()):
+            if not PDB.is_aa(residue, standard=True):
+                continue
+            hetflag, _resseq, _icode = residue.id
+            residue.id = (" ", int(new_resseq), " ")
+            new_resseq += 1
+
+    class _TemplateSelect(PDB.Select):
+        def accept_chain(self, chain):
+            return (chain_id is None) or (chain.id == chain_id)
+
+        def accept_residue(self, residue):
+            return PDB.is_aa(residue, standard=True)
+
+        def accept_atom(self, atom):
+            # Drop alternate locations other than blank or 'A'
+            altloc = atom.get_altloc()
+            return altloc in (" ", "A")
+
+    io = PDB.PDBIO()
+    io.set_structure(structure)
+    io.save(str(output_pdb_path), select=_TemplateSelect())
+    return output_pdb_path
+
+
 def get_sequence_from_pdb(pdb_path, chain_id):
     """Extracts sequence from ATOM records of a specific chain."""
     parser = PDB.PDBParser(QUIET=True)
@@ -34,6 +96,8 @@ def create_boltz_yaml(
     auto_disulfide,
     is_cyclic,
     template_pdb_path,
+    template_chain_id=None,
+    templates_dir=None,
 ):
     """Generates a Boltz-1 YAML with optional cyclic and covalent constraints.
 
@@ -48,6 +112,18 @@ def create_boltz_yaml(
     template_pdb_path = Path(template_pdb_path).expanduser().resolve()
     if not template_pdb_path.exists():
         raise FileNotFoundError(f"Template PDB does not exist: {template_pdb_path}")
+
+    # Always provide a cleaned template to Boltz (more robust).
+    if templates_dir is None:
+        templates_dir = Path(output_path).parent / "templates"
+    else:
+        templates_dir = Path(templates_dir)
+
+    cleaned_template = _write_clean_template_pdb(
+        template_pdb_path=template_pdb_path,
+        output_pdb_path=templates_dir / f"{Path(output_path).stem}_template.pdb",
+        chain_id=template_chain_id,
+    )
     
     manifest = {
         "version": 1,
@@ -58,11 +134,13 @@ def create_boltz_yaml(
         # Always enforce chain A as template
         "templates": [
             {
-                "pdb": str(template_pdb_path),
+                # NOTE: We intentionally pass only a cleaned single-chain template PDB
+                # and do NOT set force/chain_id/template_id here.
+                "pdb": str(cleaned_template),
                 # "chain_id": ["A"],
                 # "template_id": ["A"],
-                "force": True,
-                "threshold": 2.0,
+                # "force": True,
+                # "threshold": 2.0,
             }
         ],
     }
@@ -118,13 +196,23 @@ def parse_results(boltz_out_dir, csv_path, structures_dir):
         data = np.load(plddt_files[0].resolve())
         arr = data[data.files[0]]
 
-        binder_length = len(get_sequence_from_pdb(pred_dir / src_struct.name, "A"))
-        target_length = len(get_sequence_from_pdb(pred_dir / src_struct.name, "B"))
+        # In BindCraft/Boltz YAML we use chain A=target and chain B=binder.
+        target_seq = get_sequence_from_pdb(pred_dir / src_struct.name, "A")
+        binder_seq = get_sequence_from_pdb(pred_dir / src_struct.name, "B")
+        if not target_seq or not binder_seq:
+            continue
+
+        target_length = len(target_seq)
+        binder_length = len(binder_seq)
 
         
         # Calculate mean pLDDT for target and binder, target residues are the first N residues (because chain A) and binder the last residues because chain B
-        binder_plddt = np.mean(arr[target_length:target_length + binder_length])
-        target_plddt = np.mean(arr[0:target_length]) 
+        binder_slice = arr[target_length:target_length + binder_length]
+        target_slice = arr[0:target_length]
+        if len(binder_slice) == 0 or len(target_slice) == 0:
+            continue
+        binder_plddt = float(np.mean(binder_slice))
+        target_plddt = float(np.mean(target_slice))
 
         json_files = list(pred_dir.glob("*.json"))
         if not json_files: continue
@@ -188,6 +276,10 @@ def main():
     target_chain = settings.get("chains", "A")
     binder_chain = "B" # Defaulting to B as per standard design outputs
 
+    # Template chain: by default use the target chain. This produces a single-chain
+    # template file which is more robust and still lets Boltz assign chains.
+    template_chain = settings.get("template_chain", target_chain)
+
     # Directories
     yaml_dir = work_dir / "yaml_inputs"
     results_dir = work_dir / "predictions"
@@ -222,6 +314,8 @@ def main():
                     use_disulfide,
                     cyclic,
                     template_pdb_path=pdb,
+                    template_chain_id=template_chain,
+                    templates_dir=work_dir / "templates",
                 )
     else:
         if not fasta_files:
@@ -251,6 +345,8 @@ def main():
                     use_disulfide,
                     cyclic,
                     template_pdb_path=template_pdb,
+                    template_chain_id=template_chain,
+                    templates_dir=work_dir / "templates",
                 )
 
 
