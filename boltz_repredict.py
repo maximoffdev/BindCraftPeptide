@@ -45,10 +45,18 @@ def _write_clean_template_pdb(
             f"Requested template chain '{chain_id}' not found in {template_pdb_path}"
         )
 
+    # If the user requests a specific chain, write the cleaned template as a single
+    # chain with ID 'A'. Boltz templates are easiest to work with when the template
+    # chain ID matches the query chain ID used in the YAML (A).
+    output_chain_id = "A" if chain_id is not None else None
+
     # Renumber residues in-place (on the parsed structure) for the selected chain(s).
     for chain in model.get_chains():
         if chain_id is not None and chain.id != chain_id:
             continue
+
+        if output_chain_id is not None:
+            chain.id = output_chain_id
 
         new_resseq = 1
         for residue in list(chain.get_residues()):
@@ -60,7 +68,9 @@ def _write_clean_template_pdb(
 
     class _TemplateSelect(PDB.Select):
         def accept_chain(self, chain):
-            return (chain_id is None) or (chain.id == chain_id)
+            if chain_id is None:
+                return True
+            return chain.id == (output_chain_id or chain_id)
 
         def accept_residue(self, residue):
             return PDB.is_aa(residue, standard=True)
@@ -77,17 +87,69 @@ def _write_clean_template_pdb(
 
 
 def get_sequence_from_pdb(pdb_path, chain_id):
-    """Extracts sequence from ATOM records of a specific chain."""
+    """Extract sequence for a chain by iterating residues.
+
+    Notes:
+    - We intentionally do NOT use Bio.PDB.PPBuilder here because it can drop residues
+      when backbone atoms are missing, which can make the YAML sequence shorter than
+      the template residues and trigger Boltz template parsing/indexing errors.
+    - We include only standard amino acids (plus a small set of common aliases).
+    """
+
+    three_to_one = {
+        "ALA": "A",
+        "CYS": "C",
+        "ASP": "D",
+        "GLU": "E",
+        "PHE": "F",
+        "GLY": "G",
+        "HIS": "H",
+        "ILE": "I",
+        "LYS": "K",
+        "LEU": "L",
+        "MET": "M",
+        "ASN": "N",
+        "PRO": "P",
+        "GLN": "Q",
+        "ARG": "R",
+        "SER": "S",
+        "THR": "T",
+        "VAL": "V",
+        "TRP": "W",
+        "TYR": "Y",
+        # common non-canonical residue names that should map cleanly
+        "MSE": "M",
+    }
+
     parser = PDB.PDBParser(QUIET=True)
     try:
-        structure = parser.get_structure('protein', pdb_path)
-        ppb = PDB.PPBuilder()
-        for chain in structure[0]:
-            if chain.id == chain_id:
-                return "".join([str(pp.get_sequence()) for pp in ppb.build_peptides(chain)])
+        structure = parser.get_structure("protein", str(pdb_path))
+        model = structure[0]
+
+        chain = None
+        for c in model:
+            if c.id == chain_id:
+                chain = c
+                break
+        if chain is None:
+            return None
+
+        seq = []
+        for residue in chain.get_residues():
+            hetflag, _resseq, _icode = residue.id
+            if hetflag != " ":
+                continue
+            resname = residue.get_resname().upper()
+            aa = three_to_one.get(resname)
+            if aa is None:
+                # Skip non-standard residues (keeps consistency with template cleaning).
+                continue
+            seq.append(aa)
+
+        return "".join(seq) if seq else None
     except Exception as e:
         print(f"Error parsing {pdb_path}: {e}")
-    return None
+        return None
 
 def create_boltz_yaml(
     output_path,
@@ -124,6 +186,18 @@ def create_boltz_yaml(
         output_pdb_path=templates_dir / f"{Path(output_path).stem}_template.pdb",
         chain_id=template_chain_id,
     )
+
+    # Defensive check: ensure the query sequence for chain A matches the template residue count.
+    # If they differ (often due to missing backbone atoms and PPBuilder-style extraction),
+    # Boltz may crash while indexing template residues against the query sequence.
+    template_seq = get_sequence_from_pdb(cleaned_template, "A")
+    if template_seq is not None and len(template_seq) != len(target_seq):
+        print(
+            f"[WARN] Template/query length mismatch for '{Path(output_path).name}': "
+            f"len(template)={len(template_seq)} vs len(target_seq)={len(target_seq)}. "
+            "Omitting template to avoid Boltz template parsing crash."
+        )
+        cleaned_template = None
     
     manifest = {
         "version": 1,
@@ -131,16 +205,12 @@ def create_boltz_yaml(
             {"protein": {"id": "A", "sequence": target_seq, "msa": "empty"}},
             {"protein": {"id": "B", "sequence": binder_seq, "msa": "empty", "cyclic": is_cyclic}}
         ],
-        # Always enforce chain A as template
-        "templates": [
+        # Prefer a single-chain cleaned template when compatible; otherwise omit templates.
+        "templates": [] if cleaned_template is None else [
             {
                 # NOTE: We intentionally pass only a cleaned single-chain template PDB
                 # and do NOT set force/chain_id/template_id here.
                 "pdb": str(cleaned_template),
-                # "chain_id": ["A"],
-                # "template_id": ["A"],
-                # "force": True,
-                # "threshold": 2.0,
             }
         ],
     }
