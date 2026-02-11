@@ -9,12 +9,81 @@ from pyrosetta.rosetta.core.select.residue_selector import ChainSelector
 from pyrosetta.rosetta.protocols.simple_moves import AlignChainMover
 from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
 from pyrosetta.rosetta.protocols.relax import FastRelax
+from pyrosetta.rosetta.protocols.denovo_design import DisulfidizeMover
+from pyrosetta.rosetta.core.pack.task import TaskFactory
+from pyrosetta.rosetta.core.pack.task.operation import RestrictToRepacking
 from pyrosetta.rosetta.core.simple_metrics.metrics import RMSDMetric
 from pyrosetta.rosetta.core.select import get_residues_from_subset
 from pyrosetta.rosetta.core.io import pose_from_pose
 from pyrosetta.rosetta.protocols.rosetta_scripts import XmlObjects
 from .generic_utils import clean_pdb
 from .biopython_utils import hotspot_residues
+
+################################################################################################
+
+
+import re
+from pathlib import Path
+
+def collect_pdbs(scan_root: Path):
+    """Collect PDBs under scan_root.
+
+    If a Relaxed subfolder exists (or any file lives under Relaxed), prefer only Relaxed PDBs.
+    Excludes Binder/ and Best/ by default to keep only complex predictions.
+    """
+    if not scan_root.exists():
+        return []
+
+    pdbs = sorted(scan_root.rglob("*.pdb"))
+    if not pdbs:
+        return []
+
+    relaxed = [p for p in pdbs if "Relaxed" in p.parts]
+    if relaxed:
+        # Prefer Relaxed PDBs, but keep unrelaxed ones that don't have a relaxed counterpart.
+        relaxed_by_name = {p.name: p for p in relaxed}
+        unrelaxed = [p for p in pdbs if "Relaxed" not in p.parts]
+        unrelaxed_without_relaxed_copy = [p for p in unrelaxed if p.name not in relaxed_by_name]
+        pdbs = list(relaxed) + unrelaxed_without_relaxed_copy
+
+    pdbs = [p for p in pdbs if "Binder" not in p.parts and "Best" not in p.parts]
+    return pdbs
+
+
+
+#Utils used in  the rescoreing of boltz repredicted structures after design
+def parse_design_and_model(pdb_path: Path):
+    """Return (design_name, model_number) from a *_modelN.pdb name.
+
+    If the file does not match the pattern, model_number is set to 1.
+    """
+    stem = pdb_path.stem
+    match = _MODEL_RE.match(stem)
+    if not match:
+        return stem, 1
+    return match.group("base"), int(match.group("model"))
+
+
+
+def infer_single_disulfide_pair_from_binder_sequence(binder_seq: str):
+    """Infer a single disulfide pair from binder sequence.
+
+    Assumption (per workflow simplification): exactly two cysteines exist in every binder
+    and they should be stapled together.
+
+    Returns a list of one tuple with 0-based binder-local indices, or None if not possible.
+    """
+    cys_positions = [i for i, aa in enumerate(binder_seq) if aa == "C"]
+    if len(cys_positions) != 2:
+        return None
+    return [(cys_positions[0], cys_positions[1])]
+
+
+_MODEL_RE = re.compile(r"^(?P<base>.+)_model(?P<model>\d+)$")
+
+
+
+################################################################################################
 
 # Rosetta interface scores
 def score_interface(pdb_file, binder_chain="B"):
@@ -55,7 +124,7 @@ def score_interface(pdb_file, binder_chain="B"):
     # Convert the list into a comma-separated string
     interface_residues_pdb_ids_str = ','.join(interface_residues_pdb_ids)
 
-    # Calculate the percentage of hydrophobic residues at the interface of the binder
+    #  the percentage of hydrophobic residues at the interface of the binder
     hydrophobic_aa = set('ACFILMPVWY')
     hydrophobic_count = sum(interface_AA[aa] for aa in hydrophobic_aa)
     if interface_nres != 0:
@@ -81,7 +150,7 @@ def score_interface(pdb_file, binder_chain="B"):
         interface_hbond_percentage = None
         interface_bunsch_percentage = None
 
-    # calculate binder energy score
+    #  binder energy score
     chain_design = ChainSelector(binder_chain)
     tem = pr.rosetta.core.simple_metrics.metrics.TotalEnergyMetric()
     tem.set_scorefunction(scorefxn)
@@ -201,11 +270,41 @@ def unaligned_rmsd(reference_pdb, align_pdb, reference_chain_id, align_chain_id)
     return round(rmsd, 2)
 
 # Relax designed structure
-def pr_relax(pdb_file, relaxed_pdb_path):
+def pr_relax(pdb_file, relaxed_pdb_path, disulfide=False, binder_chain=None, binder_local_pairs=None):
     if not os.path.exists(relaxed_pdb_path):
         # Generate pose
         pose = pr.pose_from_pdb(pdb_file)
         start_pose = pose.clone()
+        scorefxn = pr.get_fa_scorefxn()
+
+        if disulfide and binder_chain is not None and binder_local_pairs is not None:
+            print("PyRosetta: Creating disulfide bonds in chain "+binder_chain+" at pairs: "+str(binder_local_pairs))
+            # Map binder-local indices (0-based) to pose residue indices (1-based)
+            chain_sel = ChainSelector(binder_chain)
+            subset = chain_sel.apply(pose)
+            binder_indices = pr.rosetta.core.select.get_residues_from_subset(subset)
+            if len(binder_indices) == 0:
+                # nothing to do
+                return False
+
+            # Build mapping: local 0..n-1 -> pose index
+            # binder_indices is a utility::vector1<Size>; convert to list
+            binder_pose_idxs = [binder_indices[i] for i in range(1, len(binder_indices)+1)]
+
+            disulfidizer = DisulfidizeMover()
+            disulfidizer.set_match_rt_limit(999.0)
+            disulfidizer.set_max_disulf_score(999.0)
+
+            # Apply disulfides
+            for (i, j) in binder_local_pairs or []:
+                if i < 0 or j < 0 or i >= len(binder_pose_idxs) or j >= len(binder_pose_idxs):
+                    continue
+                res1 = binder_pose_idxs[i]
+                res2 = binder_pose_idxs[j]
+                # residues are 1-based already; ensure order
+                if res1 == res2:
+                    continue
+                disulfidizer.make_disulfide(pose, int(res1), int(res2), False, scorefxn)
 
         ### Generate movemaps
         mmf = MoveMap()
@@ -215,10 +314,9 @@ def pr_relax(pdb_file, relaxed_pdb_path):
 
         # Run FastRelax
         fastrelax = FastRelax()
-        scorefxn = pr.get_fa_scorefxn()
         fastrelax.set_scorefxn(scorefxn)
         fastrelax.set_movemap(mmf) # set MoveMap
-        fastrelax.max_iter(200) # default iterations is 2500
+        fastrelax.max_iter(2500) # default iterations is 2500
         fastrelax.min_type("lbfgs_armijo_nonmonotone")
         fastrelax.constrain_relax_to_start_coords(True)
         fastrelax.apply(pose)
@@ -241,3 +339,54 @@ def pr_relax(pdb_file, relaxed_pdb_path):
         # output relaxed and aligned PDB
         pose.dump_pdb(relaxed_pdb_path)
         clean_pdb(relaxed_pdb_path)
+
+# Create disulfide bonds in binder chain and minimize
+def pr_staple_disulfides(pdb_in, pdb_out, binder_chain, binder_local_pairs):
+    # Load pose
+    pose = pr.pose_from_pdb(pdb_in)
+
+    # Map binder-local indices (0-based) to pose residue indices (1-based)
+    chain_sel = ChainSelector(binder_chain)
+    subset = chain_sel.apply(pose)
+    binder_indices = pr.rosetta.core.select.get_residues_from_subset(subset)
+    if len(binder_indices) == 0:
+        # nothing to do
+        return False
+
+    # Build mapping: local 0..n-1 -> pose index
+    # binder_indices is a utility::vector1<Size>; convert to list
+    binder_pose_idxs = [binder_indices[i] for i in range(1, len(binder_indices)+1)]
+
+    disulfidizer = DisulfidizeMover()
+    disulfidizer.set_match_rt_limit(999.0)
+    disulfidizer.set_max_disulf_score(999.0)
+
+    scorefxn = pr.get_fa_scorefxn()
+
+    # Apply disulfides
+    for (i, j) in binder_local_pairs or []:
+        if i < 0 or j < 0 or i >= len(binder_pose_idxs) or j >= len(binder_pose_idxs):
+            continue
+        res1 = binder_pose_idxs[i]
+        res2 = binder_pose_idxs[j]
+        # residues are 1-based already; ensure order
+        if res1 == res2:
+            continue
+        disulfidizer.make_disulfide(pose, int(res1), int(res2), False, scorefxn)
+
+    # Minimize with FastRelax (restrained)
+    mmf = MoveMap()
+    mmf.set_chi(True)
+    mmf.set_bb(True)
+    mmf.set_jump(False)
+    fr = FastRelax()
+    fr.set_scorefxn(scorefxn)
+    fr.set_movemap(mmf)
+    fr.max_iter(200)
+    fr.min_type("lbfgs_armijo_nonmonotone")
+    fr.constrain_relax_to_start_coords(True)
+    fr.apply(pose)
+
+    pose.dump_pdb(pdb_out)
+    clean_pdb(pdb_out)
+    return True

@@ -2,6 +2,7 @@
 ###################### BindCraft Run
 ####################################
 ### Import dependencies
+import sys
 from functions import *
 
 # Check if JAX-capable GPU is available, otherwise exit
@@ -17,18 +18,45 @@ parser.add_argument('--filters', '-f', type=str, default='./settings_filters/def
                     help='Path to the filters.json file used to filter design. If not provided, default will be used.')
 parser.add_argument('--advanced', '-a', type=str, default='./settings_advanced/default_4stage_multimer.json',
                     help='Path to the advanced.json file with additional design settings. If not provided, default will be used.')
+parser.add_argument('--prefilters', '-p', type=str, default=None,
+                    help='Path to the prefilters.json file used to pre-filter trajectories before MPNN redesign. If not provided, default will be used.')
 
 args = parser.parse_args()
 
 # perform checks of input setting files
-settings_path, filters_path, advanced_path = perform_input_check(args)
+settings_path, filters_path, advanced_path, prefilters_path = perform_input_check(args)
 
 ### load settings from JSON
-target_settings, advanced_settings, filters = load_json_settings(settings_path, filters_path, advanced_path)
+target_settings, advanced_settings, filters, prefilters = load_json_settings(settings_path, filters_path, advanced_path, prefilters_path)
+
+# Allow settings.json to enable template binder usage in hallucination (binder_advanced)
+if target_settings.get("protocol", "binder") == "binder_advanced":
+    advanced_settings["use_template_binder"] = bool(
+        target_settings.get("use_template_binder", advanced_settings.get("use_template_binder", False))
+    )
+    advanced_settings["debug_positions"] = bool(
+        target_settings.get("debug_positions", advanced_settings.get("debug_positions", False))
+    )
+
+    # Optional: explicit structural fixation weight (CA-to-template restraint)
+    if "weights_template_ca" in target_settings:
+        try:
+            advanced_settings["weights_template_ca"] = float(target_settings["weights_template_ca"])
+        except Exception:
+            pass
+    if "weights_template_ca_rmsd" in target_settings:
+        try:
+            advanced_settings["weights_template_ca_rmsd"] = float(target_settings["weights_template_ca_rmsd"])
+        except Exception:
+            pass
 
 settings_file = os.path.basename(settings_path).split('.')[0]
 filters_file = os.path.basename(filters_path).split('.')[0]
 advanced_file = os.path.basename(advanced_path).split('.')[0]
+if prefilters_path is not None:
+    prefilters_file = os.path.basename(prefilters_path).split('.')[0]
+else:
+    prefilters_file = None
 
 ### load AF2 model settings
 design_models, prediction_models, multimer_validation = load_af2_models(advanced_settings["use_multimer_design"])
@@ -45,11 +73,13 @@ trajectory_labels, design_labels, final_labels = generate_dataframe_labels()
 
 trajectory_csv = os.path.join(target_settings["design_path"], 'trajectory_stats.csv')
 mpnn_csv = os.path.join(target_settings["design_path"], 'mpnn_design_stats.csv')
+AF2_design_csv = os.path.join(target_settings["design_path"], 'AF2_design_stats.csv')
 final_csv = os.path.join(target_settings["design_path"], 'final_design_stats.csv')
 failure_csv = os.path.join(target_settings["design_path"], 'failure_csv.csv')
 
 create_dataframe(trajectory_csv, trajectory_labels)
 create_dataframe(mpnn_csv, design_labels)
+create_dataframe(AF2_design_csv, design_labels)
 create_dataframe(final_csv, final_labels)
 generate_filter_pass_csv(failure_csv, args.filters)
 
@@ -61,6 +91,13 @@ pr.init(f'-ignore_unrecognized_res -ignore_zero_occupancy -mute all -holes:dalph
 print(f"Running binder design for target {settings_file}")
 print(f"Design settings used: {advanced_file}")
 print(f"Filtering designs based on {filters_file}")
+if prefilters_file is not None and advanced_settings.get("pre_filter_trajectory", False):
+    print(f"Pre-filtering trajectories based on {prefilters_file}")
+elif prefilters_file is None and advanced_settings.get("pre_filter_trajectory", False):
+    print("-------------------------------------------------------------------------------------")
+    print("Warning: pre_filter_trajectory is enabled but no prefilters file provided, exiting...")
+    print("-------------------------------------------------------------------------------------")
+    sys.exit(1)
 
 ####################################
 # initialise counters
@@ -68,10 +105,38 @@ script_start_time = time.time()
 trajectory_n = 1
 accepted_designs = 0
 
+# Check secondary structure of binder chain in starting PDB
+if advanced_settings.get("initial_helix_check_cutoff", 100.0) < 100.0:
+    starting_pdb = target_settings["starting_pdb"]
+    binder_chain_id = "B"  # assuming binder is chain B
+    
+    # Calculate secondary structure percentages (sec_struct_only=True to skip pLDDT calculations)
+    helix_pct, sheet_pct, loop_pct, _, _, _, _, _ = calc_ss_percentage(
+        starting_pdb, 
+        advanced_settings, 
+        chain_id=binder_chain_id, 
+        sec_struct_only=True
+    )
+    
+    # Terminate if helical content detected in binder chain
+    if helix_pct > advanced_settings["initial_helix_check_cutoff"]:
+        print("-------------------------------------------------------------------------------------")
+        print(f"ERROR: Helical secondary structure detected in binder chain {binder_chain_id} ({helix_pct}% helix)")
+        print(f"The binder_advanced protocol does not support helical starting structures.")
+        print(f"Starting PDB: {starting_pdb}")
+        print("Program terminated.")
+        print("-------------------------------------------------------------------------------------")
+        sys.exit(1)
+    
+    print(f"Starting binder secondary structure check passed: {sheet_pct}% sheet, {loop_pct}% loop")
+
 ### start design loop
 while True:
     ### check if we have the target number of binders
-    final_designs_reached = check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, advanced_settings, target_settings, design_labels)
+    if advanced_settings["enable_mpnn"]:
+        final_designs_reached = check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, advanced_settings, target_settings, design_labels)
+    else:
+        final_designs_reached = check_accepted_designs(design_paths, AF2_design_csv, final_labels, final_csv, advanced_settings, target_settings, design_labels)
 
     if final_designs_reached:
         # stop design loop execution
@@ -91,8 +156,42 @@ while True:
     seed = int(np.random.randint(0, high=999999, size=1, dtype=int)[0])
 
     # sample binder design length randomly from defined distribution
-    samples = np.arange(min(target_settings["lengths"]), max(target_settings["lengths"]) + 1)
-    length = np.random.choice(samples)
+    if target_settings.get("protocol", "binder") == "binder_advanced":
+        # ensure length is minimum length of already existing binder chain
+        length = get_chain_length(target_settings["starting_pdb"], "B")  # assuming binder is chain B
+    elif target_settings.get("protocol", "binder") == "binder":
+        min_length = min(target_settings["lengths"])
+        max_length = max(target_settings["lengths"]) if max(target_settings["lengths"]) > min_length else min_length
+        samples = np.arange(min_length, max_length + 1)
+        length = np.random.choice(samples)
+    else:
+        print(f"Invalid protocol specified in settings.json, {target_settings.get('protocol', 'None')}, exiting...")
+        sys.exit(1)
+
+    ds_pairs = []
+    # load desired disulfide pairs if provided
+    ds_pairs_pre = advanced_settings.get("disulfide_pairs")
+    if ds_pairs_pre and len(ds_pairs_pre) > 0:
+        # validate provided pairs
+        valid = True
+        seen = set()
+        for (i, j) in ds_pairs_pre:
+            if j == -1:
+                # allow -1 to indicate last residue
+                j = length - 1
+            if i == j or i < 0 or j < 0 or i >= length or j >= length:
+                valid = False
+                break
+            if abs(i - j) < advanced_settings.get("disulfide_min_sep", 5):
+                valid = False
+                break
+            if i in seen or j in seen:
+                valid = False
+                break
+            seen.add(i); seen.add(j)
+            ds_pairs.append((i, j))
+        if not valid:
+            ds_pairs = []
 
     # load desired helicity value to sample different secondary structure contents
     helicity_value = load_helicity(advanced_settings)
@@ -106,8 +205,8 @@ while True:
         print("Starting trajectory: "+design_name)
 
         ### Begin binder hallucination
-        trajectory = binder_hallucination(design_name, target_settings["starting_pdb"], target_settings["chains"],
-                                            target_settings["target_hotspot_residues"], length, seed, helicity_value,
+        trajectory = binder_hallucination(design_name, target_settings["starting_pdb"], target_settings.get("protocol", "binder"), target_settings["chains"],
+                                            target_settings["target_hotspot_residues"], target_settings.get("pos", None), length, seed, ds_pairs, helicity_value,
                                             design_models, advanced_settings, design_paths, failure_csv)
         trajectory_metrics = copy_dict(trajectory._tmp["best"]["aux"]["log"]) # contains plddt, ptm, i_ptm, pae, i_pae
         trajectory_pdb = os.path.join(design_paths["Trajectory"], design_name + ".pdb")
@@ -164,270 +263,181 @@ while True:
             if not trajectory_interface_residues:
                 print("No interface residues found for "+str(design_name)+", skipping MPNN optimization")
                 continue
-            
-            if advanced_settings["enable_mpnn"]:
-                # initialise MPNN counters
-                mpnn_n = 1
-                accepted_mpnn = 0
-                mpnn_dict = {}
-                design_start_time = time.time()
 
-                ### MPNN redesign of starting binder
+            if advanced_settings.get("direct_trajectory_filtering", False) or advanced_settings.get("pre_filter_trajectory", False) or advanced_settings["enable_mpnn"] == False:
+                # Filter the original trajectory sequence directly without MPNN redesign
+                if advanced_settings.get("pre_filter_trajectory", False):
+                    if prefilters_file is not None:
+                        print("Pre-filtering trajectory based on "+str(prefilters_file)+"...")
+                        trajectory_filters = prefilters
+                        trajectory_filters_file = prefilters_file
+                    else:
+                        print("No extra pre-filters file provided, using default filters...")
+                        trajectory_filters = filters
+                        trajectory_filters_file = filters_file
+                elif advanced_settings.get("direct_trajectory_filtering", False) or advanced_settings["enable_mpnn"] == False:
+                    trajectory_filters = filters
+                    trajectory_filters_file = filters_file
+                    print("Direct trajectory filtering enabled...")
+                else:
+                    trajectory_filters = None
+                    trajectory_filters_file = None
+                    print("No trajectory filtering enabled...")
+
+                if trajectory_filters is not None:
+                    complex_prediction_model, binder_prediction_model = init_prediction_models(
+                        trajectory_pdb=trajectory_pdb,
+                        length=length,
+                        mk_afdesign_model=mk_afdesign_model,
+                        multimer_validation=multimer_validation,
+                        target_settings=target_settings,
+                        advanced_settings=advanced_settings
+                    )
+                    
+                    # Extract only the binder portion from the full complex sequence
+                    # trajectory_sequence contains target+binder, we need only the last 'length' residues
+                    if target_settings.get("protocol", "binder") == "binder_advanced":
+                        binder_sequence = trajectory_sequence[-length:]
+                        sequence = binder_sequence
+                    else:
+                        sequence = trajectory_sequence
+
+                    filter_conditions, AF2_design_csv, failure_csv, final_csv = filter_design(
+                        sequence=sequence,
+                        basis_design_name=design_name,
+                        design_paths=design_paths,
+                        trajectory_pdb=trajectory_pdb,
+                        length=length,
+                        helicity_value=helicity_value,
+                        seed=seed,
+                        prediction_models=prediction_models,
+                        binder_chain=binder_chain,
+                        filters=trajectory_filters,
+                        design_labels=design_labels,
+                        target_settings=target_settings,
+                        advanced_settings=advanced_settings,
+                        advanced_file=advanced_file,
+                        settings_file=settings_file,
+                        filters_file=trajectory_filters_file,
+                        stats_csv=AF2_design_csv,
+                        failure_csv=failure_csv,
+                        final_csv=final_csv,
+                        complex_prediction_model=complex_prediction_model,
+                        binder_prediction_model=binder_prediction_model,
+                        is_mpnn_model=False
+                        )                   
+
+            
+            # === MPNN SEQUENCE OPTIMIZATION SECTION ===
+            # If MPNN is enabled, use ProteinMPNN to generate alternative sequences for the designed backbone
+            if advanced_settings["enable_mpnn"]:
+                # Initialize counters for tracking MPNN designs
+                mpnn_n = 1  # Counter for numbering each MPNN sequence (e.g., _mpnn1, _mpnn2, etc.)
+                accepted_mpnn = 0  # Track how many MPNN designs pass all filters for this trajectory
+                design_start_time = time.time()  # Start timer for entire MPNN optimization phase
+
+                ### Generate MPNN redesigned sequences based on the trajectory backbone
+                # mpnn_gen_sequence: Uses ProteinMPNN to sample new sequences for the fixed backbone
+                #   - Fixes interface residues if mpnn_fix_interface=True (only redesigns non-interface)
+                #   - Samples num_seqs sequences at specified temperature
+                #   - Returns dict with 'seq', 'score', and 'seqid' (sequence identity to original)
+                # ToDo: add disulfide cysteins to trajectory_interface_residues to keep them fixed
                 mpnn_trajectories = mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residues, advanced_settings)
+                
+                # Load all previously accepted sequences from CSV to avoid duplicates across trajectories
                 existing_mpnn_sequences = set(pd.read_csv(mpnn_csv, usecols=['Sequence'])['Sequence'].values)
 
-                # create set of MPNN sequences with allowed amino acid composition
+                # Parse restricted amino acids if force_reject_AA is enabled
+                # If force_reject_AA=True, sequences containing any omit_AAs will be rejected
                 restricted_AAs = set(aa.strip().upper() for aa in advanced_settings["omit_AAs"].split(',')) if advanced_settings["force_reject_AA"] else set()
 
+                # Filter and deduplicate MPNN sequences, then sort by MPNN score (lower is better)
+                # Dictionary comprehension ensures uniqueness by using sequence as key
+                # Filters applied:
+                #   1. Remove sequences containing restricted amino acids (if force_reject_AA=True)
+                #   2. Remove duplicate sequences already in the CSV from previous trajectories
+                #   3. Extract only the binder portion (last 'length' residues) from full complex sequence
                 mpnn_sequences = sorted({
-                    mpnn_trajectories['seq'][n][-length:]: {
-                        'seq': mpnn_trajectories['seq'][n][-length:],
-                        'score': mpnn_trajectories['score'][n],
-                        'seqid': mpnn_trajectories['seqid'][n]
+                    mpnn_trajectories['seq'][n][-length:]: {  # Use binder sequence as dict key for deduplication
+                        'seq': mpnn_trajectories['seq'][n][-length:],  # Binder sequence only
+                        'score': mpnn_trajectories['score'][n],  # MPNN log probability score
+                        'seqid': mpnn_trajectories['seqid'][n]  # Sequence identity to trajectory sequence
                     } for n in range(advanced_settings["num_seqs"])
                     if (not restricted_AAs or not any(aa in mpnn_trajectories['seq'][n][-length:].upper() for aa in restricted_AAs))
                     and mpnn_trajectories['seq'][n][-length:] not in existing_mpnn_sequences
-                }.values(), key=lambda x: x['score'])
+                }.values(), key=lambda x: x['score'])  # Sort by MPNN score (most confident first)
 
+                # Free memory from the large existing sequences set
                 del existing_mpnn_sequences
   
+                # === CHECK IF SEQUENCES SURVIVED FILTERING ===
                 # check whether any sequences are left after amino acid rejection and duplication check, and if yes proceed with prediction
                 if mpnn_sequences:
-                    # add optimisation for increasing recycles if trajectory is beta sheeted
+                    # Optimization: Increase AF2 recycles for beta-sheet-rich designs (they need more refinement)
+                    # Beta-sheet structures are harder to predict accurately, so we give them more recycles
                     if advanced_settings["optimise_beta"] and float(trajectory_beta) > 15:
                         advanced_settings["num_recycles_validation"] = advanced_settings["optimise_beta_recycles_valid"]
 
-                    ### Compile prediction models once for faster prediction of MPNN sequences
-                    clear_mem()
-                    # compile complex prediction model
-                    complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings["num_recycles_validation"], data_dir=advanced_settings["af_params_dir"], 
-                                                                use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
-                    if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
-                        complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                            rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=True)
-                    else:
-                        complex_prediction_model.prep_inputs(pdb_filename=target_settings["starting_pdb"], chain=target_settings["chains"], binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                            rm_target_sc=advanced_settings["rm_template_sc_predict"])
+                    ### === COMPILE ALPHAFOLD2 PREDICTION MODELS ===
+                    # Pre-compile AF2 models once to avoid recompilation for each sequence (speeds up predictions)
+                    clear_mem()  # Clear GPU memory before loading new models
+                    
+                    # Compile the binder-target complex prediction model
+                    # This model predicts how the MPNN sequence folds when bound to the target
+                    complex_prediction_model, binder_prediction_model = init_prediction_models(
+                        trajectory_pdb=trajectory_pdb,
+                        length=length,
+                        mk_afdesign_model=mk_afdesign_model,
+                        multimer_validation=multimer_validation,
+                        target_settings=target_settings,
+                        advanced_settings=advanced_settings
+                    )
 
-                    # compile binder monomer prediction model
-                    binder_prediction_model = mk_afdesign_model(protocol="hallucination", use_templates=False, initial_guess=False, 
-                                                                use_initial_atom_pos=False, num_recycles=advanced_settings["num_recycles_validation"], 
-                                                                data_dir=advanced_settings["af_params_dir"], use_multimer=multimer_validation)
-                    binder_prediction_model.prep_inputs(length=length)
-
-                    # iterate over designed sequences        
+                    # === ITERATE OVER MPNN SEQUENCES FOR VALIDATION ===
+                    # For each MPNN-designed sequence, predict its structure and calculate quality metrics
                     for mpnn_sequence in mpnn_sequences:
-                        mpnn_time = time.time()
-
-                        # generate mpnn design name numbering
-                        mpnn_design_name = design_name + "_mpnn" + str(mpnn_n)
-                        mpnn_score = round(mpnn_sequence['score'],2)
-                        mpnn_seqid = round(mpnn_sequence['seqid'],2)
-
-                        # add design to dictionary
-                        mpnn_dict[mpnn_design_name] = {'seq': mpnn_sequence['seq'], 'score': mpnn_score, 'seqid': mpnn_seqid}
-
-                        # save fasta sequence
-                        if advanced_settings["save_mpnn_fasta"] is True:
-                            save_fasta(mpnn_design_name, mpnn_sequence['seq'], design_paths)
+                       
+                        filter_conditions, mpnn_csv, failure_csv, final_csv = filter_design(
+                            sequence=mpnn_sequence,
+                            basis_design_name=design_name,
+                            design_paths=design_paths,
+                            trajectory_pdb=trajectory_pdb,
+                            length=length,
+                            helicity_value=helicity_value,
+                            seed=seed,
+                            prediction_models=prediction_models,
+                            binder_chain=binder_chain,
+                            filters=filters,
+                            design_labels=design_labels,
+                            target_settings=target_settings,
+                            advanced_settings=advanced_settings,
+                            advanced_file=advanced_file,
+                            settings_file=settings_file,
+                            filters_file=filters_file,
+                            stats_csv=mpnn_csv,
+                            failure_csv=failure_csv,
+                            final_csv=final_csv,
+                            complex_prediction_model=complex_prediction_model,
+                            binder_prediction_model=binder_prediction_model,
+                            is_mpnn_model=True,
+                            mpnn_n=mpnn_n
+                            )   
                         
-                        ### Predict mpnn redesigned binder complex using masked templates
-                        mpnn_complex_statistics, pass_af2_filters = predict_binder_complex(complex_prediction_model,
-                                                                                        mpnn_sequence['seq'], mpnn_design_name,
-                                                                                        target_settings["starting_pdb"], target_settings["chains"],
-                                                                                        length, trajectory_pdb, prediction_models, advanced_settings,
-                                                                                        filters, design_paths, failure_csv)
-
-                        # if AF2 filters are not passed then skip the scoring
-                        if not pass_af2_filters:
-                            print(f"Base AF2 filters not passed for {mpnn_design_name}, skipping interface scoring")
-                            mpnn_n += 1
-                            continue
-
-                        # calculate statistics for each model individually
-                        for model_num in prediction_models:
-                            mpnn_design_pdb = os.path.join(design_paths["MPNN"], f"{mpnn_design_name}_model{model_num+1}.pdb")
-                            mpnn_design_relaxed = os.path.join(design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{model_num+1}.pdb")
-
-                            if os.path.exists(mpnn_design_pdb):
-                                # Calculate clashes before and after relaxation
-                                num_clashes_mpnn = calculate_clash_score(mpnn_design_pdb)
-                                num_clashes_mpnn_relaxed = calculate_clash_score(mpnn_design_relaxed)
-
-                                # analyze interface scores for relaxed af2 trajectory
-                                mpnn_interface_scores, mpnn_interface_AA, mpnn_interface_residues = score_interface(mpnn_design_relaxed, binder_chain)
-
-                                # secondary structure content of starting trajectory binder
-                                mpnn_alpha, mpnn_beta, mpnn_loops, mpnn_alpha_interface, mpnn_beta_interface, mpnn_loops_interface, mpnn_i_plddt, mpnn_ss_plddt = calc_ss_percentage(mpnn_design_pdb, advanced_settings, binder_chain)
-                                
-                                # unaligned RMSD calculate to determine if binder is in the designed binding site
-                                rmsd_site = unaligned_rmsd(trajectory_pdb, mpnn_design_pdb, binder_chain, binder_chain)
-
-                                # calculate RMSD of target compared to input PDB
-                                target_rmsd = target_pdb_rmsd(mpnn_design_pdb, target_settings["starting_pdb"], target_settings["chains"])
-
-                                # add the additional statistics to the mpnn_complex_statistics dictionary
-                                mpnn_complex_statistics[model_num+1].update({
-                                    'i_pLDDT': mpnn_i_plddt,
-                                    'ss_pLDDT': mpnn_ss_plddt,
-                                    'Unrelaxed_Clashes': num_clashes_mpnn,
-                                    'Relaxed_Clashes': num_clashes_mpnn_relaxed,
-                                    'Binder_Energy_Score': mpnn_interface_scores['binder_score'],
-                                    'Surface_Hydrophobicity': mpnn_interface_scores['surface_hydrophobicity'],
-                                    'ShapeComplementarity': mpnn_interface_scores['interface_sc'],
-                                    'PackStat': mpnn_interface_scores['interface_packstat'],
-                                    'dG': mpnn_interface_scores['interface_dG'],
-                                    'dSASA': mpnn_interface_scores['interface_dSASA'], 
-                                    'dG/dSASA': mpnn_interface_scores['interface_dG_SASA_ratio'],
-                                    'Interface_SASA_%': mpnn_interface_scores['interface_fraction'],
-                                    'Interface_Hydrophobicity': mpnn_interface_scores['interface_hydrophobicity'],
-                                    'n_InterfaceResidues': mpnn_interface_scores['interface_nres'],
-                                    'n_InterfaceHbonds': mpnn_interface_scores['interface_interface_hbonds'],
-                                    'InterfaceHbondsPercentage': mpnn_interface_scores['interface_hbond_percentage'],
-                                    'n_InterfaceUnsatHbonds': mpnn_interface_scores['interface_delta_unsat_hbonds'],
-                                    'InterfaceUnsatHbondsPercentage': mpnn_interface_scores['interface_delta_unsat_hbonds_percentage'],
-                                    'InterfaceAAs': mpnn_interface_AA,
-                                    'Interface_Helix%': mpnn_alpha_interface,
-                                    'Interface_BetaSheet%': mpnn_beta_interface,
-                                    'Interface_Loop%': mpnn_loops_interface,
-                                    'Binder_Helix%': mpnn_alpha,
-                                    'Binder_BetaSheet%': mpnn_beta,
-                                    'Binder_Loop%': mpnn_loops,
-                                    'Hotspot_RMSD': rmsd_site,
-                                    'Target_RMSD': target_rmsd
-                                })
-
-                                # save space by removing unrelaxed predicted mpnn complex pdb?
-                                if advanced_settings["remove_unrelaxed_complex"]:
-                                    os.remove(mpnn_design_pdb)
-
-                        # calculate complex averages
-                        mpnn_complex_averages = calculate_averages(mpnn_complex_statistics, handle_aa=True)
-                        
-                        ### Predict binder alone in single sequence mode
-                        binder_statistics = predict_binder_alone(binder_prediction_model, mpnn_sequence['seq'], mpnn_design_name, length,
-                                                                trajectory_pdb, binder_chain, prediction_models, advanced_settings, design_paths)
-
-                        # extract RMSDs of binder to the original trajectory
-                        for model_num in prediction_models:
-                            mpnn_binder_pdb = os.path.join(design_paths["MPNN/Binder"], f"{mpnn_design_name}_model{model_num+1}.pdb")
-
-                            if os.path.exists(mpnn_binder_pdb):
-                                rmsd_binder = unaligned_rmsd(trajectory_pdb, mpnn_binder_pdb, binder_chain, "A")
-
-                            # append to statistics
-                            binder_statistics[model_num+1].update({
-                                    'Binder_RMSD': rmsd_binder
-                                })
-
-                            # save space by removing binder monomer models?
-                            if advanced_settings["remove_binder_monomer"]:
-                                os.remove(mpnn_binder_pdb)
-
-                        # calculate binder averages
-                        binder_averages = calculate_averages(binder_statistics)
-
-                        # analyze sequence to make sure there are no cysteins and it contains residues that absorb UV for detection
-                        seq_notes = validate_design_sequence(mpnn_sequence['seq'], mpnn_complex_averages.get('Relaxed_Clashes', None), advanced_settings)
-
-                        # measure time to generate design
-                        mpnn_end_time = time.time() - mpnn_time
-                        elapsed_mpnn_text = f"{'%d hours, %d minutes, %d seconds' % (int(mpnn_end_time // 3600), int((mpnn_end_time % 3600) // 60), int(mpnn_end_time % 60))}"
-
-
-                        # Insert statistics about MPNN design into CSV, will return None if corresponding model does note exist
-                        model_numbers = range(1, 6)
-                        statistics_labels = ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'i_pLDDT', 'ss_pLDDT', 'Unrelaxed_Clashes', 'Relaxed_Clashes', 'Binder_Energy_Score', 'Surface_Hydrophobicity',
-                                            'ShapeComplementarity', 'PackStat', 'dG', 'dSASA', 'dG/dSASA', 'Interface_SASA_%', 'Interface_Hydrophobicity', 'n_InterfaceResidues', 'n_InterfaceHbonds', 'InterfaceHbondsPercentage',
-                                            'n_InterfaceUnsatHbonds', 'InterfaceUnsatHbondsPercentage', 'Interface_Helix%', 'Interface_BetaSheet%', 'Interface_Loop%', 'Binder_Helix%',
-                                            'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Hotspot_RMSD', 'Target_RMSD']
-
-                        # Initialize mpnn_data with the non-statistical data
-                        mpnn_data = [mpnn_design_name, advanced_settings["design_algorithm"], length, seed, helicity_value, target_settings["target_hotspot_residues"], mpnn_sequence['seq'], mpnn_interface_residues, mpnn_score, mpnn_seqid]
-
-                        # Add the statistical data for mpnn_complex
-                        for label in statistics_labels:
-                            mpnn_data.append(mpnn_complex_averages.get(label, None))
-                            for model in model_numbers:
-                                mpnn_data.append(mpnn_complex_statistics.get(model, {}).get(label, None))
-
-                        # Add the statistical data for binder
-                        for label in ['pLDDT', 'pTM', 'pAE', 'Binder_RMSD']:  # These are the labels for binder alone
-                            mpnn_data.append(binder_averages.get(label, None))
-                            for model in model_numbers:
-                                mpnn_data.append(binder_statistics.get(model, {}).get(label, None))
-
-                        # Add the remaining non-statistical data
-                        mpnn_data.extend([elapsed_mpnn_text, seq_notes, settings_file, filters_file, advanced_file])
-
-                        # insert data into csv
-                        insert_data(mpnn_csv, mpnn_data)
-
-                        # find best model number by pLDDT
-                        plddt_values = {i: mpnn_data[i] for i in range(11, 15) if mpnn_data[i] is not None}
-
-                        # Find the key with the highest value
-                        highest_plddt_key = int(max(plddt_values, key=plddt_values.get))
-
-                        # Output the number part of the key
-                        best_model_number = highest_plddt_key - 10
-                        best_model_pdb = os.path.join(design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{best_model_number}.pdb")
-
-                        # run design data against filter thresholds
-                        filter_conditions = check_filters(mpnn_data, design_labels, filters)
+                        # === DESIGN PASSED FILTERS - ACCEPT IT ===
                         if filter_conditions == True:
-                            print(mpnn_design_name+" passed all filters")
-                            accepted_mpnn += 1
-                            accepted_designs += 1
-                            
-                            # copy designs to accepted folder
-                            shutil.copy(best_model_pdb, design_paths["Accepted"])
-
-                            # insert data into final csv
-                            final_data = [''] + mpnn_data
-                            insert_data(final_csv, final_data)
-
-                            # copy animation from accepted trajectory
-                            if advanced_settings["save_design_animations"]:
-                                accepted_animation = os.path.join(design_paths["Accepted/Animation"], f"{design_name}.html")
-                                if not os.path.exists(accepted_animation):
-                                    shutil.copy(os.path.join(design_paths["Trajectory/Animation"], f"{design_name}.html"), accepted_animation)
-
-                            # copy plots of accepted trajectory
-                            plot_files = os.listdir(design_paths["Trajectory/Plots"])
-                            plots_to_copy = [f for f in plot_files if f.startswith(design_name) and f.endswith('.png')]
-                            for accepted_plot in plots_to_copy:
-                                source_plot = os.path.join(design_paths["Trajectory/Plots"], accepted_plot)
-                                target_plot = os.path.join(design_paths["Accepted/Plots"], accepted_plot)
-                                if not os.path.exists(target_plot):
-                                    shutil.copy(source_plot, target_plot)
-
-                        else:
-                            print(f"Unmet filter conditions for {mpnn_design_name}")
-                            failure_df = pd.read_csv(failure_csv)
-                            special_prefixes = ('Average_', '1_', '2_', '3_', '4_', '5_')
-                            incremented_columns = set()
-
-                            for column in filter_conditions:
-                                base_column = column
-                                for prefix in special_prefixes:
-                                    if column.startswith(prefix):
-                                        base_column = column.split('_', 1)[1]
-
-                                if base_column not in incremented_columns:
-                                    failure_df[base_column] = failure_df[base_column] + 1
-                                    incremented_columns.add(base_column)
-
-                            failure_df.to_csv(failure_csv, index=False)
-                            shutil.copy(best_model_pdb, design_paths["Rejected"])
+                            accepted_mpnn += 1  # Increment counter for this trajectory
+                            accepted_designs += 1  # Increment global counter
                         
-                        # increase MPNN design number
+                        # Increment MPNN design counter
                         mpnn_n += 1
 
-                        # if enough mpnn sequences of the same trajectory pass filters then stop
+                        # === CHECK IF ENOUGH DESIGNS ACCEPTED FROM THIS TRAJECTORY ===
+                        # Stop processing more MPNN sequences if we've reached the limit for this trajectory
+                        # This prevents wasting compute on a single very good trajectory
                         if accepted_mpnn >= advanced_settings["max_mpnn_sequences"]:
                             break
 
+                    # === TRAJECTORY MPNN OPTIMIZATION COMPLETE ===
                     if accepted_mpnn >= 1:
                         print("Found "+str(accepted_mpnn)+" MPNN designs passing filters")
                         print("")
@@ -436,29 +446,34 @@ while True:
                         print("")
 
                 else:
+                    # No sequences survived filtering (all were duplicates or contained restricted AAs)
                     print('Duplicate MPNN designs sampled with different trajectory, skipping current trajectory optimisation')
                     print("")
 
-                # save space by removing unrelaxed design trajectory PDB
+                # === CLEANUP: REMOVE UNRELAXED TRAJECTORY PDB ===
+                # Save disk space by removing the original unrelaxed trajectory structure
                 if advanced_settings["remove_unrelaxed_trajectory"]:
                     os.remove(trajectory_pdb)
 
-                # measure time it took to generate designs for one trajectory
+                # Calculate and print total time for MPNN optimization of this trajectory
                 design_time = time.time() - design_start_time
                 design_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(design_time // 3600), int((design_time % 3600) // 60), int(design_time % 60))}"
                 print("Design and validation of trajectory "+design_name+" took: "+design_time_text)
 
-            # analyse the rejection rate of trajectories to see if we need to readjust the design weights
+            # === ACCEPTANCE RATE MONITORING ===
+            # Check if the design process is too inefficient and should be stopped
+            # Only starts monitoring after start_monitoring trajectories to allow initial exploration
             if trajectory_n >= advanced_settings["start_monitoring"] and advanced_settings["enable_rejection_check"]:
-                acceptance = accepted_designs / trajectory_n
+                acceptance = accepted_designs / trajectory_n  # Calculate success rate
                 if not acceptance >= advanced_settings["acceptance_rate"]:
+                    # Too many trajectories are failing - likely poor design settings
                     print("The ratio of successful designs is lower than defined acceptance rate! Consider changing your design settings!")
                     print("Script execution stopping...")
                     break
 
-        # increase trajectory number
+        # Increment trajectory counter and free memory
         trajectory_n += 1
-        gc.collect()
+        gc.collect()  # Force garbage collection to free GPU/CPU memory
 
 ### Script finished
 elapsed_time = time.time() - script_start_time

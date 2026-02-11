@@ -12,6 +12,8 @@ from .pyrosetta_utils import *
 from .colabdesign_utils import *
 from .biopython_utils import *
 from .generic_utils import *
+from .bindcraft_utils import *
+from .cbc_boltz_utils import *
 
 # suppress warnings
 #os.environ["SLURM_STEP_NODELIST"] = os.environ["SLURM_NODELIST"]

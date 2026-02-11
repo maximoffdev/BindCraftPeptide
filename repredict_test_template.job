@@ -1,0 +1,23 @@
+#!/bin/bash
+#SBATCH --partition=clara
+#SBATCH --job-name=boltz
+#SBATCH --time=0:30:00
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:v100:1
+#SBATCH --output=./logs/output_template.%j.log
+#SBATCH --error=./logs/error_template.%j.log
+#SBATCH --mem=16GB
+
+# 1. FIX: Export the variable so the child processes can see it
+# Using a specific directory is faster than disabling it entirely
+export NUMBA_CACHE_DIR=./numba_cache
+mkdir -p $NUMBA_CACHE_DIR
+
+
+
+# 3. Run your script
+# Note: I removed the --cache flag from the boltz call inside your script 
+# if it was causing issues, as it's usually for model data.
+
+
+python -u ./boltz_repredict.py --input_dir boltz_test_template_notemplate/ -e boltz --use_disulfide --no_template

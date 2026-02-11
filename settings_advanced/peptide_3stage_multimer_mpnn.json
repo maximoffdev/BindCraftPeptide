@@ -62,5 +62,12 @@
     "start_monitoring": 1000,
     "af_params_dir": "",
     "dssp_path": "",
-    "dalphaball_path": ""
+    "dalphaball_path": "",
+    "use_disulfide_loss": false,
+    "weights_disulfide": 1.0,
+    "disulfide_num": 1,
+    "disulfide_min_sep": 5,
+    "disulfide_cutoff": 7.0,
+    "disulfide_pairs": [],
+    "binder_chain": "B"
 }

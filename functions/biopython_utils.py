@@ -127,6 +127,39 @@ def calculate_clash_score(pdb_file, threshold=2.4, only_ca=False):
 
     return len(valid_pairs)
 
+def get_chain_length(pdb_file, chain_id):
+    """
+    Get the number of residues in a specific chain of a PDB file.
+    
+    Args:
+        pdb_file (str): Path to the PDB file
+        chain_id (str): Chain identifier (e.g., 'A', 'B')
+    
+    Returns:
+        int: Number of standard amino acid residues in the chain
+    
+    Raises:
+        ValueError: If the chain is not found in the PDB file
+    """
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure('protein', pdb_file)
+    
+    # Get the first model
+    model = structure[0]
+    
+    # Check if chain exists
+    if chain_id not in model:
+        available_chains = [chain.id for chain in model]
+        raise ValueError(f"Chain '{chain_id}' not found in PDB file. Available chains: {available_chains}")
+    
+    # Get the specified chain
+    chain = model[chain_id]
+    
+    # Count standard amino acid residues
+    residue_count = sum(1 for residue in chain if is_aa(residue, standard=True))
+    
+    return residue_count
+
 three_to_one_map = {
     'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
     'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
@@ -173,7 +206,7 @@ def hotspot_residues(trajectory_pdb, binder_chain="B", atom_distance_cutoff=4.0)
     return interacting_residues
 
 # calculate secondary structure percentage of design
-def calc_ss_percentage(pdb_file, advanced_settings, chain_id="B", atom_distance_cutoff=4.0):
+def calc_ss_percentage(pdb_file, advanced_settings, chain_id="B", atom_distance_cutoff=4.0, sec_struct_only=False):
     # Parse the structure
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure('protein', pdb_file)
@@ -204,7 +237,7 @@ def calc_ss_percentage(pdb_file, advanced_settings, chain_id="B", atom_distance_
 
             ss_counts[ss_type] += 1
 
-            if ss_type != 'loop':
+            if ss_type != 'loop' and not sec_struct_only:
                 # calculate secondary structure normalised pLDDT
                 avg_plddt_ss = sum(atom.bfactor for atom in residue) / len(residue)
                 plddts_ss.append(avg_plddt_ss)
@@ -213,8 +246,9 @@ def calc_ss_percentage(pdb_file, advanced_settings, chain_id="B", atom_distance_
                 ss_interface_counts[ss_type] += 1
 
                 # calculate interface pLDDT
-                avg_plddt_residue = sum(atom.bfactor for atom in residue) / len(residue)
-                plddts_interface.append(avg_plddt_residue)
+                if not sec_struct_only:
+                    avg_plddt_residue = sum(atom.bfactor for atom in residue) / len(residue)
+                    plddts_interface.append(avg_plddt_residue)
 
     # Calculate percentages
     total_residues = sum(ss_counts.values())

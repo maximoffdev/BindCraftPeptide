@@ -208,3 +208,24 @@ Thanks to Lennart Nickel, Yehlin Cho, Casper Goverde, and Sergey Ovchinnikov for
  <li>Justas Dauparas's ProteinMPNN (https://github.com/dauparas/ProteinMPNN)</li>
  <li>PyRosetta (https://github.com/RosettaCommons/PyRosetta.notebooks)</li>
 </ul>
+
+## Docker command execution
+
+docker run --rm -it --gpus all \
+  -v "$(pwd)":/workspace -w /workspace \
+  -p 8890:8888 \
+  -v "$(pwd)/.cache/matplotlib":/mplcache -e MPLCONFIGDIR=/mplcache \
+  bindcraft-gpu:custom \
+  python -u ./bindcraft.py \
+    --settings './example/c5/c5.json' \
+    --filters './settings_filters/default_filters.json' \
+    --prefilters './settings_filters/default_filters.json' \
+    --advanced './settings_advanced/betasheet_4stage_multimer_flexible.json'
+
+docker run --rm -it --gpus all -v "$(pwd)":/workspace -w /workspace -p 8891:8888 -v "$(pwd)/.cache/matplotlib":/mplcache -e MPLCONFIGDIR=/mplcache bindcraft-gpu:custom python -u ./bindcraft.py --settings './example/c5/c5_partial.json' --advanced './settings_advanced/test
+_settings_peptide_betasheet_4stage_multimer.json' --filters './settings_filters/test_filters_peptides_motif.json' --prefilters './settings_filters/test_filters_peptides_motif.json'
+
+
+This worked last: (it runs docker with sudo)
+
+docker run --rm -it --gpus all   -u root   -v "$(pwd)":/workspace -w /workspace   -p 8891:8888   -v "$(pwd)/.cache/matplotlib":/mplcache -e MPLCONFIGDIR=/mplcache   bindcraft-gpu:custom   python -u ./bindcraft.py     --settings './example/paul/settings_scaffold.json'     --advanced './settings_advanced/test_settings_peptide_betasheet_4stage_multimer.json'     --filters './settings_filters/no_filters.json'

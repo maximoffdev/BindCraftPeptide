@@ -1,0 +1,25 @@
+#!/bin/bash
+#SBATCH --partition=clara
+#SBATCH --job-name=pscaf
+#SBATCH --time=24:00:00
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:v100:1
+#SBATCH --output=./logs/output_pipe_pep_scaf.%j.log
+#SBATCH --error=./logs/error_pipe_pep_scaf.%j.log
+#SBATCH --mem=16GB
+#SBATCH --array=1-10
+
+
+echo "Starting design pipeline job"
+echo ""
+
+
+
+~/.conda/envs/BindCraft/bin/python -u ./cyclic_bindcraft.py \
+--settings './input/settings_pipeline_tinker.json' \
+--advanced './settings_advanced/test_settings_peptide_betasheet_4stage_multimer_1.json' \
+--filters './settings_filters/cbc_filters.json'
+
+echo "Finished design starting reprediction step"
+
+

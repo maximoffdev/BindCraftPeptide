@@ -1338,5 +1338,27 @@
     "5_Binder_RMSD": {
         "threshold": 3.5,
         "higher": false
+    },
+    "boltz_confidence_score": {
+        "threshold": 0.8, 
+        "higher": true
+    },
+    "boltz_pLDDT_binder": {
+        "threshold": 75.0,
+         "higher": true
+    },
+    "boltz_ipTM_complex": {
+        "threshold": 0.7, 
+        "higher": true
+    },
+    "dG": {
+        "threshold": -5.0, "higher": false},
+    "Relaxed_Clashes": {
+        "threshold": 0, 
+        "higher": false
+    },
+    "Target_RMSD": {
+        "threshold": 3.5, 
+        "higher": false
     }
 }
