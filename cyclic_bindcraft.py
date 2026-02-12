@@ -922,8 +922,6 @@ def main():
         for pdb_path  in relaxed_pdbs:
 
            
-            print ('the for loop begins here!')
-            print('An the relexed pdbs are:', relaxed_pdbs)
             try:
                 
                 unrelaxed_candidate = design_path / "Repredicted" / pdb_path.name
