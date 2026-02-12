@@ -47,7 +47,7 @@ def save_pdb_with_seqres(pdb_path, output_path):
         f.writelines(seqres_lines)
         f.write(atom_data)
 
-def create_boltz_yaml(yaml_path, target_seq, binder_seq, auto_disulfide, is_cyclic,use_template,input_struct,template_dir):
+def create_boltz_yaml(yaml_path, target_seq, binder_seq, auto_disulfide, is_cyclic,use_template,input_struct,template_dir,force,threshold):
     """Generates Boltz-1 YAML with cyclic/covalent constraints for BindCraft."""
 
 
@@ -80,12 +80,21 @@ def create_boltz_yaml(yaml_path, target_seq, binder_seq, auto_disulfide, is_cycl
         target_pdb = template_dir / input_struct.name.replace('.pdb', '_template.pdb')
 
         save_pdb_with_seqres(input_struct, target_pdb)
-
-        manifest["templates"] = [
-            {
-                "pdb": str(target_pdb.resolve())
-            }
+        if force: 
+            manifest["templates"] = [
+                {
+                "pdb": str(target_pdb.resolve()),
+                "force": True,      # 
+                "threshold": threshold    # Distance in Angstroms the bakcbone can deviate from the template
+                }
             ]
+        else:
+            manifest["templates"] = [
+                {
+                "pdb": str(target_pdb.resolve()),
+                }
+
+                ]
     # Ensure 
     with open(yaml_path, 'w') as f:
         yaml.dump(manifest, f, default_flow_style=False, sort_keys=False)
