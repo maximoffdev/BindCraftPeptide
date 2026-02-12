@@ -1,0 +1,25 @@
+version: 1
+sequences:
+- protein:
+    id: A
+    sequence: EVQLLQSGPELEKPGASVMISCKASGSSFTGYNMNWVRQNIGKSLEWIGAIDPYYGGTSYNQKFKGRATLTVDKSSSTAYMHLKSLTSEDSAVYYCVSGMEYWGQGTSVTVSGGGGGGGGGGGGGGGDVVMTQTPLSLPVSLGDQASISCRSSQSLVHRNGNTYLHWYLQKPGQSPKLLIHKVSNRFSGVPDRFSGSGSGTDFTLKISRVEAEDLGVYFCSQSTHVPPLTFGAGTKLEL
+    msa: empty
+- protein:
+    id: B
+    sequence: CPTLSGGPGSPRSC
+    msa: empty
+    cyclic: false
+constraints:
+- bond:
+    atom1:
+    - B
+    - 1
+    - SG
+    atom2:
+    - B
+    - 14
+    - SG
+templates:
+- pdb: /work/ps40kyji-cyclicbindcraft/BindCraftPeptide/pipeline_tinker_output_template_force/boltz_reprediction/templates/peptide_l14_s396359_template.pdb
+  force: true
+  threshold: 4.0
