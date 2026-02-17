@@ -817,10 +817,10 @@ def main():
         )
         
         #Cleanup Boltz templates to save space (optional)
-        clean_up = True
-        dir_to_remove = design_path / "boltz_reprediction" 
-        if clean_up :
-            shutil.rmtree(dir_to_remove)
+        #clean_up = True
+        #dir_to_remove = design_path / "boltz_reprediction" 
+        #if clean_up :
+           # shutil.rmtree(dir_to_remove)
 
 
         #Boltz Reprediction finished --> PyRosetta Relaxation and Scoring of Boltz outputs
@@ -947,7 +947,8 @@ def main():
                 
                 complex_statistics = {
                     
-                    
+                    'Trajectory_pLDDT': trajectory_metrics.get('plddt'),
+                    'Trajectory_i_pTM': trajectory_metrics.get('i_ptm'),
                     'Unrelaxed_Clashes': num_clashes_unrelaxed,
                     'Relaxed_Clashes': num_clashes_relaxed,
                     'Binder_Energy_Score': interface_scores['binder_score'],
