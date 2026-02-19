@@ -1,4 +1,12 @@
 {
+    "Trajectory_pLDDT": {
+        "threshold": null,
+        "higher": true
+    },
+    "Trajectory_i_pTM": {
+        "threshold": null,
+        "higher": true
+    },
     "boltz_confidence_score": {
         "threshold": 0.90,
         "higher": true
